@@ -1,0 +1,13 @@
+[package]
+name = "astrcode-ext-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 扩展共用工具：竞技场分配器、SIMD JSON、用量统计与文本格式化"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+bumpalo.workspace = true
+simd-json.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "astrcode-ext-cache-doctor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：观测 provider 请求的 prompt 前缀，定位缓存断点"
+
+[[bin]]
+name = "astrcode-ext-cache-doctor"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+astrcode-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# `testing` feature 只用于测试，不进入生产依赖：它暴露 HostApi 注入缝隙。
+astrcode-extension-worker = { workspace = true, features = ["testing"] }
+async-trait.workspace = true

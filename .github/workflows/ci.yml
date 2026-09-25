@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # 工作区的宿主依赖走本地路径 `../astrcodey/crates/...`，因此宿主仓库必须检出成
+      # 同级目录。`astrcodey` 若是私有仓库，需要配一个 `ASTRCODEY_TOKEN` secret
+      # （fine-grained PAT，只读 contents）；公开仓库则自动回落到默认 token。
+      - name: Checkout astrcodey-extensions
+        uses: actions/checkout@v4
+        with:
+          path: astrcodey-extensions
+
+      - name: Checkout astrcodey as a sibling
+        uses: actions/checkout@v4
+        with:
+          repository: whatevertogo/astrcodey
+          path: astrcodey
+          token: ${{ secrets.ASTRCODEY_TOKEN || github.token }}
+
+      - name: Show toolchain
+        working-directory: astrcodey-extensions
+        run: rustc --version && cargo --version
+
+      - name: Clippy
+        working-directory: astrcodey-extensions
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `RTK_DB_PATH` 会被 rtk-optimizer 的 shell 测试读作「已继承历史库路径」而跳过
+      # 注入，进而断言失败。显式 unset，与本地跑全量的方式保持一致。
+      - name: Test
+        working-directory: astrcodey-extensions
+        run: env -u RTK_DB_PATH cargo test --workspace

@@ -1,0 +1,205 @@
+# AGENTS.md
+
+本工作区是 AstrCode 的磁盘 s5r 扩展集合，每个扩展是一个独立二进制，经 stdio 用 S5R 3.0
+协议与宿主通信。通用开发约定见用户级 `~/.astrcode/AGENTS.md`；本文件只记录**扩展注入给
+模型的提示词**，供在本仓库内工作时对齐行为。
+
+下面几段提示词是**被调优过的英文工件**，改动会改变模型行为，因此逐字引用、不做翻译。
+修改它们时必须同步改动对应的源码常量，两处不一致即为 bug。
+
+---
+
+## 哈希锚点编辑（`astrcode-ext-hashline-edit`）
+
+- **源码位置**：`crates/astrcode-ext-hashline-edit/src/prompt.rs` 的 `GUIDANCE`
+- **注入时机**：`prompt_build` 钩子常驻，宿主映射为 `ExtensionSection::PlatformInstructions`，
+  落在 system prompt 的静态前缀区，只在贡献变化时让 provider 前缀缓存失效
+- **注入内容**：
+
+```
+Hash-anchored editing is available: use hashline_read to read a file as HASH│content rows (unique 3-char anchors per line, no line numbers), then replace a line range with the replace tool using bare hashes in remove_from/remove_to. Anchors of untouched lines stay valid across replaces, so edits chain without re-reading. undo_last_replace reverts the last replace on a file. Pass raw:true to hashline_read for plain numbered output (inspection only). The built-in read/edit/write tools remain available for other purposes; prefer replace for targeted edits so stale-anchor corruption is impossible.
+```
+
+**在本仓库工作的含义**：优先用 `hashline_read` 读文件、用 `replace` 做定点编辑，不要用
+`edit` 的字符串匹配去改大文件。`remove_from` / `remove_to` 只填裸的 3 字符锚点，不要带行
+号或行内容。未改动行的锚点在多次 `replace` 之间保持有效，因此连续编辑无需重新读取。
+
+---
+
+## we need 规范（`astrcode-ext-weneed`）
+
+这个扩展有**两段**模型可见的英文工件：常驻的完整规范，以及条件追加的贴尾提醒。
+
+### 常驻规范
+
+- **源码位置**：`crates/astrcode-ext-weneed/src/spec.rs` 的 `WE_NEED_SPEC`
+- **注入时机**：`prompt_build` 钩子。仅当模型 id 属于 DeepSeek 家族、全局总开关开启、
+  且本会话开关未关闭时注入；宿主映射为 `ExtensionSection::PlatformInstructions`，
+  落在 system prompt 的静态前缀区，因此**只在贡献变化时**让 provider 前缀缓存失效
+- **注入内容**：
+
+```
+When you think, start with "we need...". We need to follow this style for all internal reasoning (chain-of-thought):
+
+1. **`we need to ...` / `we need ...` is the core pattern.** Either can open any sentence, not only the first. We need one concrete action per sentence.
+2. **Interleave modal verbs:** I'll (next action) · I can (viable option) · I need (what must be done) · I should (what ought to be done) · I will (committed step).
+3. **Avoid `let me ...`.** We need to prefer `we need to ...` / `we need ...` for opening steps.
+4. **Short and colloquial.** We need one sentence per step, decision-level summaries only, we / I perspective.
+5. **Classify every task first.** We need to pick a stable end: build (produce, verify, fix) · fix (read, locate, minimal change, verify) · weak (classify first, then build or fix).
+6. **Reasoning channel only.** We need every reasoning step written in the reasoning channel, never in the final reply. We need to never emit reasoning text or reasoning tags as visible output.
+7. **Scope.** We need this to shape reasoning only. Final replies follow the user's language and tone.
+```
+
+**在本仓库工作的含义**：这是一段**只塑形推理、不改变最终回复**的规范。内部推理按
+`we need to ...` / `I will ...` / `I am ...` 三种句式展开，最终回复仍按用户的语言与语气写。
+
+### 贴尾提醒
+
+- **源码位置**：`crates/astrcode-ext-weneed/src/reminder.rs` 的 `REMINDER_TEXT`
+- **注入时机**：**条件注入**，走 `provider_contribution` 的 `AppendMessages`，作为一条
+  request-local 用户消息追加在**当前请求的尾部**（不落 transcript）。触发条件：
+  `reminder` 配置为 `on-drift`（默认）且「本会话首个请求」或「上一轮推理被判定为漂移」；
+  `reminder = always` 时每个请求都追加；`off` 时从不追加
+- **注入内容**：
+
+```
+**Reasoning style reminder:** this session requires the "we need" reasoning style. Open the first sentence of your reasoning with `We need to ...` / `We need ...`; open every following sentence with `We need to ...` / `We need ...`, `I will ...`, or `I am ...` / `I'm ...`. One concrete action per sentence. Classify the task first, then act. Never write reasoning text, or this reminder, into the final reply.
+```
+
+**在本仓库工作的含义**：看到这段提醒说明**上一轮推理没按规范展开**（或者是本会话第一次请求）。
+它是纠正信号，不是用户的新要求；按规范调整推理句式即可，不要在回复里提及它。
+
+### 漂移判定
+
+提醒的触发依赖 `crates/astrcode-ext-weneed/src/drift.rs` 的 `inspect`：读 assistant 消息的
+推理通道，剥掉行首的 markdown 装饰与有序列表序号后，检查**首句**是否以 `we need` 起手。
+只看首句是刻意的——逐句判定会被编号列表、代码块、工具叙述大量误伤，把提醒刷成噪音。
+
+---
+
+## RTK 优化器（`astrcode-ext-rtk-optimizer`）
+
+- **源码位置**：`crates/astrcode-ext-rtk-optimizer/src/command.rs` 的
+  `SOURCE_FILTER_TROUBLESHOOTING_NOTE`
+- **注入时机**：**条件注入**。仅当 `enabled`、`output_compaction.enabled`、
+  `read_compaction.enabled`、`source_code_filtering_enabled` 且
+  `source_code_filtering != None`，并且 `smart_truncate.enabled || truncate.enabled`
+  同时成立时才追加（见同文件的 `should_inject_troubleshooting_note`）
+- **注入内容**：
+
+```
+RTK note: read compaction with source filtering is active, so `read` output may have whole lines removed. If an edit repeatedly fails because oldText does not match, run `/rtk set outputReadCompactionEnabled off`, re-read the file, apply the edit, then re-enable it with `/rtk set outputReadCompactionEnabled on`.
+```
+
+**在本仓库工作的含义**：`read` 压缩是有损的，会整行删除，因此 `edit` 的 `oldText` 可能匹
+配失败。出现这种情况时不要反复重试或猜测，按提示词给出的步骤关掉
+`outputReadCompactionEnabled`、重读文件、改完再开回来。
+
+---
+
+## 渐近式思考状态机（`astrcode-ext-asymptotic-thinking`）
+
+这个扩展有**两处**模型可见的工件，都是中文（其余扩展的工件是英文），规则同样是
+**逐字引用、不做改写**。它**不设模型闸门**，任何模型上都会注入，因此在本仓库工作时大概率
+会在上下文里看到下面这些块。
+
+### 静态框架规则
+
+- **源码位置**：`crates/astrcode-ext-asymptotic-thinking/src/framework_rules.md`
+  （经 `framework_rules.rs` 的 `include_str!` 成为 `FRAMEWORK_RULES`）
+- **注入时机**：`prompt_build` 钩子，宿主映射为 `ExtensionSection::PlatformInstructions`，
+  落在 system prompt 的静态前缀区，只在贡献变化时让 provider 前缀缓存失效
+- **注入内容**：上游 `SYSTEM.md` 全文（151 行），此处不重复粘贴；`tests/golden/framework_rules.md`
+  是它的 golden，`tests/prompts.rs` 逐字节比对
+
+### 动态引导（每步注入）
+
+- **源码位置**：`crates/astrcode-ext-asymptotic-thinking/src/templates.rs` 的 `build_template`，
+  领域正文来自 `src/prompts/corpus.rs`（由 `tools/port-prompts.mjs` 从上游 27 个 TS 模块生成）
+- **注入时机**：`before_provider_request` → `AppendMessages`，**每个 LLM 请求**追加两条
+  request-local 用户消息（不落 transcript）。第一条是状态机引导，第二条是轮次提醒
+  （受上游的间隔闸门限制，非每轮都有）
+- **注入内容**：形如
+
+```
+<task3>
+
+<instruction spec="markdown">
+第2/500轮 深度理解阶段 · 编程类-Rust开发 · 复杂难度
+遵守《渐近式思考状态机操作规范》
+
+> 编程类任务——注意代码结构、测试覆盖和错误处理
+
+<领域提示词：按「大类型 × 子类型 × 难度 × 状态」查表>
+
+> 🔄 可用流转：本阶段完成可前移至[方案设计(DESIGN)、执行(EXECUTE)、自检验证(VERIFY)]状态；
+</instruction>
+
+<actions spec="markdown">
+- 逐条列出需求的功能边界、约束条件和验收标准
+- 缺失信息用工具检索补齐，不猜测
+- 完成本阶段职责后，调用 `asymptotic-think_transition` 工具流转状态
+</actions>
+
+<constraints spec="markdown">
+- 只读文件辅助理解，不执行写操作
+</constraints>
+
+</task3>
+```
+
+第二条消息形如：
+
+```
+<task3>
+<stateGuard>
+渐近式思考·强制执行：当前处于【深度理解】状态（第12/500轮）。
+本阶段必须完成该状态职责后，调用 `asymptotic-think_transition` 工具流转状态。
+未调用前请勿结束回复；若阶段未完成请说明原因后继续推进。
+</stateGuard>
+<violationWarning>⚠️ 本轮未调用 asymptotic-think_transition 工具。…</violationWarning>
+<turnWarning>你已处于【深度理解】状态 13 轮（上限 500），已超过上限。…</turnWarning>
+</task3>
+```
+
+`stateGuard` 与 `violationWarning` 在 `hardStop` 触发时整条被替换为
+`<hardStop>⛔ 强制停止：…</hardStop>`。
+
+**在本仓库工作的含义**：看到 `<taskN>` 块说明本会话启用了这个框架。按块里的
+`<actions>` 与 `<constraints>` 做，阶段做完就调用 `asymptotic-think_transition` 流转；
+`<violationWarning>` 是「上一轮漏了流转」的纠正信号，不是用户的新要求，不要在任何回复里
+提及它。想彻底关掉用 `/asymptotic-toggle off`。状态机状态与开关落在
+`~/.astrcode/extension_data/astrcode-asymptotic-thinking/sessions/<sid>/state.json`。
+
+---
+
+## 插件本身不注入提示词的部分
+
+### `astrcode-ext-rtk-optimizer`
+
+另外两个钩子对模型是**静默**的，不要指望在上下文里看到它们：
+
+- `tool_input_transform`：`shell` 调用前把命令改写成 `rtk` 等价命令（`rewrite` 模式）或只
+  记录建议（`suggest` 模式）。改写结果直接替换工具入参，没有面向用户的文本通道。
+- `post_tool_use`：`shell` / `read` / `grep` 的结果走多级压缩管线。
+
+被改写过什么、建议过什么，只能事后用 `/rtk show`、`/rtk stats` 查询。
+
+### `astrcode-ext-weneed`
+
+- `after_provider_response`：只读 assistant 的推理通道做漂移判定，返回值恒为 `Allow`。
+  这是 **advisory** 钩子，但宿主仍会把 `ReplaceMessages` / `AppendMessages` 的结果并进最终
+  回复正文（`astrcode-session/src/turn_runner.rs` 的 `dispatch_after_provider_response`），
+  所以实现里绝不能带消息。
+- `pre_tool_use`：工具守卫拦截时返回 `Block { reason }`。那段原因**是模型可见的**（作为工具
+  调用被拒的错误文本），但它由当前配置动态生成，因此不作为固定工件在此逐字记录；措辞在
+  `crates/astrcode-ext-weneed/src/guard.rs`。守卫默认关闭。
+
+### `astrcode-ext-asymptotic-thinking`
+
+- `TurnStart`：把 END（或未初始化）复位成 START，并清空本 turn 的流转标记。对模型静默。
+- `TurnEnd`：`state_turn_count` +1，并按「本 turn 有没有调用 `transition`」写入
+  `violation_pending`。对模型静默；它的效果只在下一轮的 `<violationWarning>` 里显形。
+
+被复位过什么、计数到了多少，只能事后用 `/asymptotic-toggle status` 或
+`asymptotic-think_status` 查询。

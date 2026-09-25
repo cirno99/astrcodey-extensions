@@ -1,0 +1,5 @@
+{
+  "extension_id": "astrcode-asymptotic-thinking",
+  "protocol": { "s5r": "3.0" },
+  "command": ["./astrcode-ext-asymptotic-thinking"]
+}

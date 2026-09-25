@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/astrcode-ext-common",
+    "crates/astrcode-ext-cache-doctor",
+    "crates/astrcode-ext-cache-usage",
+    "crates/astrcode-ext-context-offload",
+    "crates/astrcode-ext-hashline-edit",
+    "crates/astrcode-ext-rtk-optimizer",
+    "crates/astrcode-ext-weneed",
+    "crates/astrcode-ext-asymptotic-thinking",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+# 宿主 SDK：磁盘 s5r 扩展的作者面。astrcodey 未发布到 crates.io，因此走本地路径。
+# 若改为远程依赖，只需改这一处：
+#   astrcode-extension-worker = { git = "https://github.com/whatevertogo/astrcodey", branch = "main" }
+astrcode-extension-sdk = { path = "../astrcodey/crates/astrcode-extension-sdk" }
+astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-worker" }
+
+astrcode-ext-common = { path = "crates/astrcode-ext-common" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", default-features = false }
+
+# 非加密快速哈希。hashline-edit 的查找表以行内容/锚点为键，每次编辑对整份文件
+# 重建几遍；实测纯散列快 4.1x、完整 replace 路径快 1.24x（见该 crate 的
+# tests/performance.rs）。键空间是用户自己的源码，不是对抗性输入，
+# 不需要 SipHash 的 HashDoS 防护。
+rustc-hash = "2"
+
+# 正则：rtk-optimizer 的构建/测试/linter/源码过滤识别规则直接来自上游 TS 实现，
+# 逐条改写成正则字面量才能逐条对照验收；手写扫描器会在十几处引入静默分歧。
+regex = "1"
+
+# 竞技场分配器：单次调用内的临时分配，调用结束整体复位，不逐块归还全局分配器。
+bumpalo = { version = "3", features = ["collections"] }
+# SIMD JSON：插件自己拥有的字节缓冲的就地解析（解析时就地反转义，需要可变输入）。
+simd-json = "0.18"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

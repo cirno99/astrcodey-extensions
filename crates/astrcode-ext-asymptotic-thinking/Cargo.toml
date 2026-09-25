@@ -1,0 +1,27 @@
+[package]
+name = "astrcode-ext-asymptotic-thinking"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：六态渐近式思考状态机（适用于所有模型）"
+
+[[bin]]
+name = "astrcode-ext-asymptotic-thinking"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+astrcode-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# templates.ts 的两条清洗规则（去「当前为…（…难度）。」开头、去含 transition 工具名的行）
+# 直接来自上游 TS 实现，逐条写成正则字面量才能逐条对照验收。
+regex.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# `testing` feature 只用于测试，不进入生产依赖：它暴露 HostApi 注入缝隙。
+astrcode-extension-worker = { workspace = true, features = ["testing"] }
+async-trait.workspace = true

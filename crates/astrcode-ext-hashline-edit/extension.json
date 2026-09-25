@@ -1,0 +1,5 @@
+{
+  "extension_id": "astrcode-hashline-edit",
+  "protocol": { "s5r": "3.0" },
+  "command": ["./astrcode-ext-hashline-edit"]
+}

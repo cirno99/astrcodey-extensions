@@ -1,0 +1,26 @@
+[package]
+name = "astrcode-ext-rtk-optimizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：把 shell 命令改写成 rtk 等价命令，并压缩工具输出"
+
+[[bin]]
+name = "astrcode-ext-rtk-optimizer"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+astrcode-ext-common.workspace = true
+bumpalo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# `testing` feature 只用于测试，不进入生产依赖：它暴露 HostApi 注入缝隙。
+astrcode-extension-worker = { workspace = true, features = ["testing"] }
+async-trait.workspace = true
