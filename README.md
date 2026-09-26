@@ -14,9 +14,6 @@ crates/
   astrcode-ext-hashline-edit/   hashline_read/replace/undo —— 哈希锚点编辑（每行一个地址）
   astrcode-ext-rtk-optimizer/   tool_input_transform + post_tool_use —— 命令改写与输出压缩
   astrcode-ext-weneed/          prompt_build + provider_contribution + pre_tool_use —— DeepSeek 的 we need 规范
-  astrcode-ext-asymptotic-thinking/
-                                prompt_build + before_provider_request + TurnStart/TurnEnd
-                                —— 六态渐近式思考状态机（适用于所有模型）
 scripts/install.sh              构建并安装到 ~/.astrcode/extensions/
 ```
 
@@ -35,7 +32,6 @@ astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-wor
 | 存放位置 | 作用域 | 读写代价 | 用在哪 |
 |---|---|---|---|
 | 插件数据目录的 `config.json` | 插件级（全局） | 启动读一次，热路径只读内存 | `weneed`、`rtk-optimizer`、`cache-doctor` |
-| 插件数据目录的 `sessions/<sid>/state.json` | 会话级 | 同上，按会话分桶 | `asymptotic-thinking` |
 | 宿主的 `astrcode.session.state` | 扩展 × 会话 | 每次读写一次 IPC（带内存缓存） | `weneed` 的会话开关 |
 
 判据展开：
@@ -50,8 +46,6 @@ astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-wor
 
 三者的**文件生命周期**（定位 → 读 → 归一化 → 原子写）由 `astrcode-ext-common` 的
 `common::config::ConfigStore` 统一承担；各 crate 只提供「怎么解析、怎么归一化」。
-`asymptotic-thinking` 的 per-session 状态存储刻意不走这条共享路径——它带 dirty 跟踪、
-版本号校验与按会话分桶，语义与「用户可编辑的配置文件」不同，硬套只会把生命周期拧成麻花。
 
 ## 常用命令
 
@@ -662,131 +656,6 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 
 ---
 
-## `astrcode-ext-asymptotic-thinking`
-
-把 pi 扩展
-[asymptotic-thinking](https://github.com/cirno99/pi-backup/tree/main/pi-config-20260916-191214/agent/extensions/asymptotic-thinking)
-（MIT）移植到 AstrCode：用一个六态状态机
-（`START → DEEP_UNDERSTAND → DESIGN → EXECUTE → VERIFY → END`）约束模型的推理节奏，
-并按「大类型 × 子类型 × 难度」注入对应的领域提示词。
-
-**与 `astrcode-ext-weneed` 不同，本插件不设模型闸门**：它适用于所有模型，在 DeepSeek 上
-也可以和 weneed 同时启用（两者注入的内容不重叠——weneed 管推理句式，本插件管流程与领域侧重）。
-
-### 用法
-
-| 工具 | 用途 |
-|---|---|
-| `asymptotic-think_set-task-info` | START 阶段设定任务画像（难度 + 大类型 + 小类型）；超限时可重估难度 |
-| `asymptotic-think_transition` | 状态流转（目标为当前状态的动态可用集，含向前/回退） |
-| `asymptotic-think_status` | 查询状态机位置、画像、轮次、可用流转 |
-
-| 命令 | 效果 |
-|---|---|
-| `/asymptotic-toggle` | 切换本会话的启用状态（默认启用） |
-| `/asymptotic-toggle on` / `off` | 显式开启 / 关闭 |
-| `/asymptotic-toggle status` | 查看开关与当前状态机位置 |
-
-三条能力链自动生效，不需要手动开启：
-
-- **静态框架规则**（`prompt_build`）：上游 `SYSTEM.md` 全文注入 system prompt 的静态前缀区。
-- **动态引导**（`before_provider_request`）：每个 LLM 请求追加两条隐藏消息——状态机引导
-  （含状态、画像、领域提示词、可用流转、路径感知适配段）与轮次提醒。
-- **轮次治理**（`TurnStart` / `TurnEnd`）：计数、END → START 复位、三级轮次警告与违规检测。
-
-状态落在 `<astrcode_dir>/extension_data/astrcode-asymptotic-thinking/sessions/<sid>/state.json`，
-状态机状态与 `/asymptotic-toggle` 开关同放一处，扩展重载或宿主重启后仍然有效。
-
-### 能力映射
-
-| 上游（pi） | AstrCode |
-|---|---|
-| `registerTool` ×3 | `worker.tool()` ×3，`ToolPlan::host(HostResource::Session)` |
-| `before_agent_start` 注入隐藏引导消息 | `before_provider_request` → `ProviderResult::AppendMessages` |
-| `before_agent_start` 追加 `SYSTEM.md` | `prompt_build` → `PromptContributions::system_prompts` |
-| `turn_end` 计数 + 三级警告 + 违规检测 | `LifecycleEvent::TurnEnd`（`HookMode::Advisory`） |
-| `before_agent_start` / `turn_end` 里的 END 复位 | `LifecycleEvent::TurnStart`（合并成一处） |
-| `before_provider_request` 调 `temperature` / `top_p` | **不可达，整层删除**（见下） |
-| `session_start` / `session_shutdown` 载入 + 清理 | 取消：按会话懒加载，无廉价会话枚举通道 |
-| SQLite 全局库 `~/.pi/agent/extension-global.db` | 按会话 JSON 文件 + 内存缓存 |
-| 27 个领域提示词模块 | `src/prompts/corpus.rs`（由生成器产出）+ `tests/golden/` 逐字对照 |
-
-### 提示词工件与逐字对照
-
-注入给模型的正文有两处，都是调优过的工件，改动会改变模型行为：
-
-| 工件 | 源码位置 | 注入时机 |
-|---|---|---|
-| 静态框架规则 | `src/framework_rules.md`（`framework_rules::FRAMEWORK_RULES`） | `prompt_build`，落在 `ExtensionSection::PlatformInstructions` |
-| 27 个领域提示词 | `src/prompts/corpus.rs` | `before_provider_request`，随状态机引导一起注入 |
-
-两者的逐字一致性由 `tests/prompts.rs` 对照 `tests/golden/` 强制。golden 不是手抄的期望值：
-`tools/port-prompts.mjs` 会**直接跑上游 TypeScript**（先复制一份上游 `src`，只替换掉会在
-模块加载期打开 SQLite 的 `session-store.ts`），把 `buildPrompt` / `buildTemplate` /
-`formatNextStateHint` 的真实输出写进 `tests/golden/prompts.json`（27 模块 × 6 难度 × 4 状态，
-外加 56 条模板样本与 49 条流转提示）。
-
-```sh
-# 上游更新时重跑（需要能跑 TypeScript 的运行时；本机用 bun 1.4.2 验证过）
-bun crates/astrcode-ext-asymptotic-thinking/tools/port-prompts.mjs <上游扩展目录>
-cargo test -p astrcode-ext-asymptotic-thinking --test prompts
-```
-
-### 与上游的差异
-
-1. **推理参数调优整层删除。** 上游按「大类型基础值 + 小类型微调 + 难度偏移」三层叠加
-   `temperature` / `top_p`（`INFERENCE_BASE` / `INFERENCE_SUB_TUNING` /
-   `DIFFICULTY_TEMP_SHIFT` 三张表）。AstrCode 没有请求体钩子，这三张表不移植。
-2. **动态引导改走请求级注入。** 上游把引导作为 durable 的隐藏消息塞进历史；AstrCode 没有
-   `sendMessage({display:false})` 通道，这里在 `before_provider_request` 里 `AppendMessages`，
-   每个 LLM 请求重算一次。两条消息都追加在消息列表**末尾**，且内容在一个 turn 内逐字节稳定
-   （计数器只在 `TurnEnd` 变），因此不破坏 provider 的前缀缓存。
-3. **持久化改为按会话 JSON 文件**，不用上游的 SQLite 全局库；开关与状态机状态同放一处。
-4. **END/空 → START 的复位合并到 `TurnStart`。** 上游分两处（`before_agent_start` 复位、
-   `turn_end` 里再检测「执行中用户发消息」补一次），`TurnStart` 天然覆盖两者。
-5. **轮次警告推迟到注入时渲染。** 上游在 `turn_end` 里算好并立即发消息；这里只计数，
-   渲染放到 `before_provider_request`——计数器在一个 turn 内不变，两处算出的级别逐位相同，
-   而推迟渲染让注入块在同一 turn 内稳定。
-6. **上游正文里的 5 处工具名/通道名改写**（全部由生成器的 `ADAPTATIONS` 声明，
-   `tests/prompts.rs` 里有反向断言）：`mempal` → `memory_list/memory_save`、
-   `web_search` → `web-search`、`web-fetch` → `fetch-url`、`resources_discover` →
-   `prompt_build` 钩子、状态机图的 `before_agent_start 自动转换` → `TurnStart 自动转换`。
-   不改会让模型去调用 AstrCode 里不存在的工具。
-7. **`status` 工具描述里的「五态流程图」改成「六态流程图」**（上游实际画的是六态）。
-8. **时间戳用 UTC。** 上游用 `new Date().toLocaleString()`；这里输出
-   `YYYY-MM-DD HH:MM:SS UTC`，不为一个前缀引入 `chrono`。
-
-### 平台边界
-
-1. **无法调请求体参数。** 见差异 1：`ProviderResult` 只有四个变体，`astrcode-core` 里根本
-   不存在 `temperature` 字段。上游最核心的那层「按任务调温度」在这里不可达。
-2. **注入是请求级、非持久的。** `AppendMessages` 只作用于当次 LLM 请求
-   （`astrcode-session/src/turn_runner.rs:865`）。代价是每步请求重算并多带约 350–450 token；
-   收益是引导在每一步都在场。上游那条 durable 消息只在 turn 开头注入一次，后续步骤靠历史重放。
-3. **`TurnEnd` 载荷贫瘠。** `LifecycleHookInput` 只有 `session_id` / `working_dir` / `model` /
-   `mid_turn_user_messages_synced`，没有上游的 `event.toolResults`。违规检测改为插件自记：
-   `transition` 工具调用时置位，`TurnEnd` 读取后写入 `violation_pending`。
-4. **无法注册状态栏条目。** 与另几个扩展相同：S5R 的 `InitializeManifest` 没有 `status_items`。
-5. **不做陈旧会话清理。** 上游用 `SessionManager.listAll()` 删库；磁盘扩展要枚举会话得申请
-   `SessionInspect` 能力且只能看到自己拥有的会话。状态文件很小，改为不清理。
-6. **工具名保留上游原名**（`asymptotic-think_transition` 等），因为提示词正文里逐字引用了它们。
-7. **`TurnEnd` 在 turn 失败时也会补发**（`turn_runner.rs:200`），计数可能多于成功轮次；
-   与上游语义一致（上游 `turn_end` 同样是结束即触发），不额外处理。
-
-### 测试
-
-```sh
-cargo test -p astrcode-ext-asymptotic-thinking
-```
-
-88 个测试，分两层：
-
-- **逐字对照**（`tests/prompts.rs`）：27 模块 × 6 难度 × 4 状态的模块正文、56 条整块引导、
-  49 条流转提示，以及静态框架规则，全部与上游 TS 的真实输出逐字节比对。
-- **端到端流**（`tests/injection.rs`）：开关是否闸住全部注入与工具、状态是否按会话隔离并落盘、
-  `TurnStart`/`TurnEnd` 的计数与复位、三个工具能否把状态机推完一整轮（含 TRIVIAL 捷径路径、
-  间隔闸门、三级警告与 hardStop）。
-- 纯逻辑（转移合法性、难度开放路径、三级阈值边界、正则清洗、时间戳历法）由各模块的单元测试覆盖。
 
 ## 关于 `bumpalo` 与 `simd-json`
 

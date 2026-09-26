@@ -8,7 +8,6 @@ members = [
     "crates/astrcode-ext-hashline-edit",
     "crates/astrcode-ext-rtk-optimizer",
     "crates/astrcode-ext-weneed",
-    "crates/astrcode-ext-asymptotic-thinking",
 ]
 
 [workspace.package]

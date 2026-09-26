@@ -44,20 +44,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "astrcode-ext-asymptotic-thinking"
-version = "0.1.0"
-dependencies = [
- "astrcode-ext-common",
- "astrcode-extension-sdk",
- "astrcode-extension-worker",
- "async-trait",
- "regex",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "astrcode-ext-cache-doctor"
 version = "0.1.0"
 dependencies = [
