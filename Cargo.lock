@@ -121,6 +121,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrcode-ext-sleep-continue"
+version = "0.1.0"
+dependencies = [
+ "astrcode-ext-common",
+ "astrcode-extension-sdk",
+ "astrcode-extension-worker",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "astrcode-ext-weneed"
 version = "0.1.0"
 dependencies = [

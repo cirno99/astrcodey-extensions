@@ -1,0 +1,25 @@
+[package]
+name = "astrcode-ext-sleep-continue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：无人值守续跑——模型停下后自动注入「继续」，提问时按推荐项自动作答"
+
+[[bin]]
+name = "astrcode-ext-sleep-continue"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+# 插件数据目录布局与配置文件的读写生命周期。
+astrcode-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# `testing` feature 只用于测试，不进入生产依赖：它暴露 HostApi 注入缝隙。
+astrcode-extension-worker = { workspace = true, features = ["testing"] }
+async-trait.workspace = true

@@ -14,6 +14,7 @@ crates/
   astrcode-ext-hashline-edit/   hashline_read/replace/undo —— 哈希锚点编辑（每行一个地址）
   astrcode-ext-rtk-optimizer/   tool_input_transform + post_tool_use —— 命令改写与输出压缩
   astrcode-ext-weneed/          prompt_build + provider_contribution + pre_tool_use —— DeepSeek 的 we need 规范
+  astrcode-ext-sleep-continue/  continue_after_stop + pre_tool_use + post_tool_use —— 无人值守续跑
 scripts/install.sh              构建并安装到 ~/.astrcode/extensions/
 ```
 
@@ -32,7 +33,7 @@ astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-wor
 | 存放位置 | 作用域 | 读写代价 | 用在哪 |
 |---|---|---|---|
 | 插件数据目录的 `config.json` | 插件级（全局） | 启动读一次，热路径只读内存 | `weneed`、`rtk-optimizer`、`cache-doctor` |
-| 宿主的 `astrcode.session.state` | 扩展 × 会话 | 每次读写一次 IPC（带内存缓存） | `weneed` 的会话开关 |
+| 宿主的 `astrcode.session.state` | 扩展 × 会话 | 每次读写一次 IPC（带内存缓存） | `weneed` 的注入开关、`sleep-continue` 的续跑开关 |
 
 判据展开：
 
@@ -653,6 +654,119 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 纯核心的正确性靠**与原版 JS 实现逐位对照**：`hashline::xxh32` 与 `hashline::hash` 里的金标准
 期望值，是把原版 `src/host.js` 的纯核心切出来在 Node 里实跑得到的。凡是对算法细节（边界重复
 的判定方向、稳定映射的锚点继承顺序）读代码推断不确定的地方，都以实测输出为准。
+
+---
+
+## `astrcode-sleep-continue`
+
+无人值守续跑。上游是 pi 插件的 `sleep-continue`（`cirno99/pi-backup` 的
+`agent/extensions/sleep-continue/src/index.ts`）；本 crate 取它的语义，落在 S5R 的钩子上，
+不照搬实现——宿主机制不同，照抄会做出一堆空转代码。
+
+### 用法
+
+```
+/sleep                     # 等价于 /sleep on
+/sleep on                  # 开启本会话的续跑（预算归零）
+/sleep off                 # 关闭本会话（全局配置不受影响）
+/sleep set 继续按计划推进   # 换续跑文本并开启
+/sleep max 200             # 单次人工 turn 的续跑上限
+/sleep idle 3              # 空转熔断阈值，0 表示关闭
+/sleep answer off          # 关掉提问自动应答
+/sleep tools add askUser   # 增删自动应答的工具
+/sleep status              # 开关、预算、统计、最近一次停止原因
+/sleep reset               # 恢复默认配置并清除本会话开关
+```
+
+开启后，模型每次**自然停下**（没有 tool call）时注入一条「继续」再推一个 step。默认续跑
+文本是 `继续`，单次 turn 上限 100 次。
+
+### 四个钩子
+
+| 钩子 | 模式 | 职责 |
+|---|---|---|
+| `continue_after_stop` | blocking | 判定该不该续跑；注入「继续」并返回 `ContinueOneStep` |
+| `pre_tool_use` | blocking | 拦下提问类工具，按推荐项自动作答 |
+| `post_tool_use` | non-blocking | 记工具活动，供空转熔断判定 |
+| `UserPromptSubmit` / `SessionStart` | non-blocking | 重置续跑预算 / 重载配置 |
+
+### 注入走 `defer_context`，不是 `provider_contribution`
+
+两者都能把一段话喂给下一轮，区别在**可见性**：
+
+- `session.control.defer_context` 追加的是一条**持久化用户消息**，在下一步边界被
+  `sync_mid_turn_user_messages` 吸收，转录里看得见——醒来能复盘插件到底做了什么。
+- `provider_contribution` 的 `AppendMessages` 只作用于单次请求、不落 transcript，是
+  goal 扩展用的路子。
+
+本插件要的是「可复盘」，所以选前者。代价是多一次 IPC 与一次 transcript 落盘；换来的是
+`/sleep` 跑了一夜之后，你翻历史就能看到每一次续跑。
+
+顺带一提，`defer_context` 会让宿主在 `has_pending_mid_turn_user_messages` 那一支继续跑，
+也就是**不加 `ContinueOneStep` 也会续跑**。这里两个都做：显式返回 `ContinueOneStep` 让
+「为什么又跑了一步」不依赖宿主的隐含分支。
+
+### 闸门：必须显式开启
+
+会话开关是**三态**（未设置 / 开 / 关），写在宿主的 `session_state` 里，因此扩展重载后
+仍然有效。判定上 `Unset` 与 `Off` 等价：**只有 `/sleep on` 过才续跑**。
+
+配置里的 `enabled` 是全局总开关（默认**开**），只用来「一次关掉所有会话」。默认必须开，
+否则 `/sleep on` 会是个静默无效的命令——新装插件的人第一次用它就撞上「命令说开了，但
+什么都不发生」，那是最坏的第一印象。
+
+### 到达上限只停止续跑，开关保持开启
+
+上限的语义是**单次人工 turn 的预算**：`UserPromptSubmit`（每个 turn 开始时派发）会把计数
+归零，所以你再输入任意一句话就重新给满。这比上游「到顶直接关掉开关」更适合真正的长任务
+——半夜上限走完只是停下等你，不会再消耗额度，早上你敲一句话它接着干。
+
+插件自己注入的消息在 turn 内被吸收，**不会**派发 `UserPromptSubmit`，因此这个归零只会被
+真正的人工输入触发。
+
+### 空转熔断
+
+看门狗在内核层面做不了（见下），替代物是空转熔断：连续 `idleStop`（默认 3）次续跑都没有
+产生**任何工具调用**就停下，并把原因留在 `/sleep status` 里。
+
+判据只看工具调用，不看文本：模型反复复述同一段总结同样是空转，而它每次都会输出非空文本。
+
+### 提问自动应答
+
+命中 `answer.tools`（默认 `["askUser"]`）的调用直接 `Block`，把选中的答案写进拦截原因回给
+模型——原因是**模型可见的**（作为工具调用被拒的错误文本）。
+
+取值优先级是「标了 `recommended: true` 的选项」→「第一个选项」。宿主内建的 `askUser` 会
+显式标记推荐项（用户超时未响应时宿主也选它），所以标记优先比上游「一律取第一个」更准；
+但**至少给出一个答案**：上游的取舍是宁可答错也不卡住，这里保持一致。多选题把所有推荐项
+一起勾上。解析不出选项时仍然拦下，退回「请按任务最合理的默认方案继续」，而不是放行——
+放行会让这一轮卡在等人的弹窗上。
+
+拦截原因里带一个逃生口：「如确需人类决策，请在回复末尾注明『需要人工确认：…』然后停下，
+不要死循环追问」。
+
+### 刻意不移植的两件事
+
+1. **看门狗（无活动 → abort）。** 插件的宿主调用走 task-local 的
+   `with_host_api` 作用域，而**这个作用域不传播到 `tokio::spawn`**
+   （见 worker 的 `with_host_api` 文档）：插件起不了任何「能在钩子之外调宿主」的定时器，
+   也就没人在超时那一刻去 abort。空转熔断补上了其中真正要紧的一半——模型不干活时停下。
+2. **错误退避重试。** 上游靠 `after_provider_response` 的 HTTP 429/5xx 触发，而
+   `ProviderHookInput` **没有 status 字段**；更要紧的是 provider 请求失败时 turn 直接报错，
+   `continue_after_stop` 根本不会被调用，那个时点上插件没有任何介入机会。工具级的
+   `is_error` 也不适合做判据：AstrCode 里 `shell` 的非零退出码就是 `is_error`，按
+   「失败/error」模式匹配会在正常干活时大量误伤，给每一轮都加上退避延迟。
+
+### 平台边界
+
+1. **无法注册状态栏条目。** S5R 的 `InitializeManifest` 没有 `status_items` 字段。本插件
+   在 `/sleep` 的命令结果里携带 `status_update`（`🌙 12/100`），因此那一格**只在敲过至少
+   一次 `/sleep` 之后**才出现，且不会每轮自动刷新。
+2. **`TurnAborted` 从未派发。** 协议里声明了 `LifecycleEvent::TurnAborted`，但宿主只发
+   `TurnStart` / `UserPromptSubmit` / `StepStart` / `StepEnd` / `TurnEnd` 等，`TurnAborted`
+   没有任何发射点。因此上游「Esc 中断即停用」做不了。**功能上没有损失**：中断之后
+   `continue_after_stop` 不会再触发，循环本就停了，只是开关保持开启。
+3. **没有 UI 通知通道。** 开启/停止/熔断都只能在 `/sleep status` 里看到。
 
 ---
 
