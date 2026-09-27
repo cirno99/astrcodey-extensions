@@ -26,7 +26,9 @@ astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-wor
 
 astrcode-ext-common = { path = "crates/astrcode-ext-common" }
 
-serde = { version = "1", features = ["derive"] }
+# `rc` 让 `Arc<T>` 可以序列化：hashline-edit 的锚点向量按 `Arc` 共享，开不开这个
+# feature 线缆形状都一样（`Arc<T>` 就按 `T` 写），只是少一次深拷贝。
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"

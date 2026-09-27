@@ -3,8 +3,9 @@
 //! 扩展是长驻进程。一次调用里如果要做「扫描 → 分类 → 汇总 → 渲染」多趟处理，
 //! 每趟都用 `String` / `Vec` 会产生大量短命堆分配，反复进出全局分配器。
 //!
-//! [`Scratch`] 复用一个 [`Bump`]：一次调用结束时 [`Scratch::finish`] 只把分配
-//! 指针拨回起点，底层 chunk 全部保留，后续调用几乎不再向全局分配器申请内存。
+//! [`Scratch`] 复用一个 [`Bump`]：一次调用结束时 [`Scratch::finish`] 把分配指针拨回
+//! 起点，底层 chunk 保留下来供下次复用。但保留有上限（[`MAX_RETAINED_BYTES`]）：处理
+//! 超大文件会把 chunk 撑到几 MB，之后即使再也不用也会一直挂在调用它的那条线程上。
 //!
 //! **生命周期约束**：竞技场里的数据在 `finish()` 后立即失效，因此只用于调用
 //! 内部的中间量；最终交给宿主的字符串仍以普通 `String` 返回。
@@ -81,9 +82,17 @@ impl Scratch {
     }
 
     /// 结束一次调用：释放全部临时分配，保留底层 chunk 供下次复用。
+    ///
+    /// 保留是有上限的：`reset` 只释放除当前块以外的块，而当前块正是最大的一块。处理过
+    /// 几万行的大文件之后，它会一直挂在这条线程上——常驻进程有十几条线程，加起来就是
+    /// 几十 MB 的常驻内存，换来的只是「同一个大文件反复编辑时少几次大块申请」。
+    /// 超过上限就整个换掉，让分配器把大块收回去；真需要时再长回来。
     pub(crate) fn finish(&mut self) {
         self.peak_reserved = self.peak_reserved.max(self.arena.allocated_bytes());
         self.arena.reset();
+        if self.arena.allocated_bytes() > MAX_RETAINED_BYTES {
+            self.arena = Bump::with_capacity(DEFAULT_SCRATCH_BYTES);
+        }
         self.resets += 1;
     }
 }
@@ -104,6 +113,13 @@ thread_local! {
 
 /// 线程本地竞技场的初始容量：覆盖「几千行文本的多趟扫描」这一常见量级。
 const DEFAULT_SCRATCH_BYTES: usize = 64 * 1024;
+
+/// 一次调用结束后最多保留多少字节的底层 chunk。
+///
+/// 64 KiB 起步的竞技场按倍增扩块，处理几万行的文件很容易长到 1 MiB 以上。保留它换来的是
+/// 「同一个大文件反复编辑时不必重新申请」，代价是**每条线程**常驻一份——十几条线程就是
+/// 十几 MB。1 MiB 以内的保留，超过就换掉。
+const MAX_RETAINED_BYTES: usize = 1024 * 1024;
 
 /// 借用线程本地竞技场跑一段同步逻辑，回调返回后整体复位。
 ///
@@ -148,6 +164,20 @@ mod tests {
         assert!(scratch.reserved_bytes() <= after_first);
         scratch.finish();
         assert_eq!(scratch.resets(), 2);
+    }
+
+    #[test]
+    fn finish_drops_a_chunk_that_grew_past_the_cap() {
+        let mut scratch = Scratch::with_capacity(4096);
+        let bulk = "z".repeat(MAX_RETAINED_BYTES);
+        let _ = join(scratch.arena(), &[&bulk], "");
+        let grown = scratch.arena().allocated_bytes();
+        assert!(grown > MAX_RETAINED_BYTES);
+
+        scratch.finish();
+        // 超过上限的块不再挂在竞技场上，下次调用从初始容量重新长。
+        assert!(scratch.arena().allocated_bytes() < grown);
+        assert!(scratch.peak_reserved_bytes() >= grown);
     }
 
     #[test]

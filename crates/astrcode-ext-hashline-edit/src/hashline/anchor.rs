@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     error::{EditError, ErrorCode},
-    hash::HASH_SEP,
+    hash::{Anchor, HASH_SEP},
     lines::{canon, clip_line},
     request::{EditRequest, HashRef},
 };
@@ -78,7 +78,7 @@ pub struct ValOutcome {
 pub fn val_edit(
     edit: &EditRequest,
     file_lines: &[&str],
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
 ) -> Result<ValOutcome, EditError> {
     // 锚点索引是调用内部的临时量：每个锚点一个候选行下标的小表，整份文件建一遍。
     with_scratch(|bump| val_edit_in(bump, edit, file_lines, file_hashes))
@@ -88,7 +88,7 @@ fn val_edit_in(
     bump: &Bump,
     edit: &EditRequest,
     file_lines: &[&str],
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
 ) -> Result<ValOutcome, EditError> {
     assert_aligned(file_lines, file_hashes, "valEdit")?;
 
@@ -177,8 +177,8 @@ fn val_edit_in(
 pub fn assert_range_served(
     resolved: &ResolvedEdit,
     file_lines: &[&str],
-    file_hashes: &[String],
-    served: &BTreeSet<String>,
+    file_hashes: &[Anchor],
+    served: &BTreeSet<Anchor>,
     file_path: Option<&str>,
 ) -> Result<(), EditError> {
     assert_aligned(file_lines, file_hashes, "assertRangeServed")?;
@@ -186,7 +186,7 @@ pub fn assert_range_served(
     let start_line = resolved.hash_bounds[0].line;
     let end_line = resolved.hash_bounds[1].line;
     let mismatch_lines: Vec<usize> = (start_line..=end_line)
-        .filter(|line| !served.contains(file_hashes[line - 1].as_str()))
+        .filter(|line| !served.contains(&file_hashes[line - 1]))
         .collect();
     if mismatch_lines.is_empty() {
         return Ok(());
@@ -246,20 +246,20 @@ pub struct MismatchFeedback {
     pub code: ErrorCode,
     pub body: String,
     /// 随反馈一并展示的当前锚点，调用方把它们记进 served 集合。
-    pub hashes: Vec<String>,
+    pub hashes: Vec<Anchor>,
 }
 
 /// 渲染锚点校验失败反馈，同时返回随反馈展示的锚点。
 pub fn fmt_mismatch_with_hashes(
     mismatches: &[Mismatch],
     file_lines: &[&str],
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
     file_path: Option<&str>,
 ) -> Result<MismatchFeedback, EditError> {
     assert_aligned(file_lines, file_hashes, "fmtMismatch")?;
 
     let mut out: Vec<String> = Vec::new();
-    let mut hashes: Vec<String> = Vec::new();
+    let mut hashes: Vec<Anchor> = Vec::new();
     let not_found_count = mismatches
         .iter()
         .filter(|mismatch| matches!(mismatch, Mismatch::NotFound { .. }))
@@ -410,7 +410,7 @@ fn resolve_or_record(
 /// 哈希数组与行数组必须一一对应；不一致说明调用方写错了，不是模型的输入问题。
 fn assert_aligned(
     file_lines: &[&str],
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
     label: &str,
 ) -> Result<(), EditError> {
     if file_hashes.len() != file_lines.len() {
@@ -604,12 +604,16 @@ mod tests {
         split_lines(SAMPLE)
     }
 
-    fn edit(from: &str, to: &str, lines: &[&str]) -> EditRequest {
+    fn edit(from: impl AsRef<str>, to: impl AsRef<str>, lines: &[&str]) -> EditRequest {
         EditRequest {
             content_lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             hash_bounds: [
-                HashRef { hash: from.to_owned() },
-                HashRef { hash: to.to_owned() },
+                HashRef {
+                    hash: from.as_ref().to_owned(),
+                },
+                HashRef {
+                    hash: to.as_ref().to_owned(),
+                },
             ],
         }
     }
@@ -638,7 +642,7 @@ mod tests {
         assert!(matches!(outcome.mismatches[0], Mismatch::NotFound { .. }));
 
         // 伪造重复哈希，触发歧义分支
-        let duplicated = ["aB3".to_owned(), "aB3".to_owned(), "cD4".to_owned()];
+        let duplicated = [Anchor::new("aB3"), Anchor::new("aB3"), Anchor::new("cD4")];
         let ambiguous = edit("aB3", "aB3", &["x"]);
         let outcome = val_edit(&ambiguous, &["a", "b", "c"], &duplicated).expect("校验失败");
         assert_eq!(outcome.mismatches.len(), 2);
@@ -690,7 +694,7 @@ mod tests {
     #[test]
     fn fmt_mismatch_reports_ambiguous_candidates_with_cap() {
         let lines: Vec<&str> = vec!["a", "b", "c", "d", "e", "f", "g"];
-        let hashes: Vec<String> = (0..7).map(|_| "aB3".to_owned()).collect();
+        let hashes: Vec<Anchor> = (0..7).map(|_| Anchor::new("aB3")).collect();
         let mismatches = vec![Mismatch::Ambiguous {
             hash: "aB3".into(),
             candidates: (1..=7).collect(),
@@ -707,7 +711,7 @@ mod tests {
     #[test]
     fn fmt_mismatch_keeps_the_second_marker_inline() {
         let lines: Vec<&str> = vec!["a", "b"];
-        let hashes: Vec<String> = vec!["aB3".to_owned(), "aB3".to_owned()];
+        let hashes: Vec<Anchor> = vec![Anchor::new("aB3"), Anchor::new("aB3")];
         let mismatches = vec![
             Mismatch::NotFound {
                 hash: "ZZZ".into(),
@@ -731,11 +735,11 @@ mod tests {
         let resolved = ResolvedEdit {
             content_lines: vec!["x".into()],
             hash_bounds: [
-                ResolvedAnchor { line: 2, hash: hashes[1].clone() },
-                ResolvedAnchor { line: 3, hash: hashes[2].clone() },
+                ResolvedAnchor { line: 2, hash: hashes[1].to_string() },
+                ResolvedAnchor { line: 3, hash: hashes[2].to_string() },
             ],
         };
-        let served: BTreeSet<String> = [hashes[1].clone(), hashes[2].clone()].into_iter().collect();
+        let served: BTreeSet<Anchor> = [hashes[1], hashes[2]].into_iter().collect();
         assert!(assert_range_served(&resolved, &lines, &hashes, &served, None).is_ok());
     }
 
@@ -746,11 +750,11 @@ mod tests {
         let resolved = ResolvedEdit {
             content_lines: vec!["x".into()],
             hash_bounds: [
-                ResolvedAnchor { line: 1, hash: hashes[0].clone() },
-                ResolvedAnchor { line: 3, hash: hashes[2].clone() },
+                ResolvedAnchor { line: 1, hash: hashes[0].to_string() },
+                ResolvedAnchor { line: 3, hash: hashes[2].to_string() },
             ],
         };
-        let served: BTreeSet<String> = [hashes[0].clone()].into_iter().collect();
+        let served: BTreeSet<Anchor> = [hashes[0]].into_iter().collect();
         let error = assert_range_served(&resolved, &lines, &hashes, &served, Some("sample.js"))
             .expect_err("应当报范围过期");
 
@@ -763,12 +767,12 @@ mod tests {
     #[test]
     fn assert_range_served_caps_the_shown_rows() {
         let lines: Vec<&str> = vec!["x"; 150];
-        let hashes: Vec<String> = (0..150).map(|index| format!("{index:03}")).collect();
+        let hashes: Vec<Anchor> = (0..150).map(|index| Anchor::new(&format!("{index:03}"))).collect();
         let resolved = ResolvedEdit {
             content_lines: vec!["x".into()],
             hash_bounds: [
-                ResolvedAnchor { line: 1, hash: hashes[0].clone() },
-                ResolvedAnchor { line: 150, hash: hashes[149].clone() },
+                ResolvedAnchor { line: 1, hash: hashes[0].to_string() },
+                ResolvedAnchor { line: 150, hash: hashes[149].to_string() },
             ],
         };
         let error = assert_range_served(&resolved, &lines, &hashes, &BTreeSet::new(), None)

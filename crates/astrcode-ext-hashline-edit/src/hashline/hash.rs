@@ -49,13 +49,44 @@
 //!
 //! 大头是 `canon` 不再逐行 `String` 分配（LF 文件里 `trim_end` 直接给出子切片），
 //! 其次是两张按内容分组的查找表改成竞技场分配，省掉每行一次全局分配。
+//!
+//! # 锚点表示：`Vec<String>` → `Vec<Anchor>`
+//!
+//! 锚点原来每行一个 3 字符 `String`，也就是每行一次 `malloc`；现在 [`Anchor`] 是
+//! `[u8; 3]`，`Vec<Anchor>` 就是 3N 字节的连续缓冲，整份向量只分配一次。
+//!
+//! 直接判据是**分配次数**，它不受机器状态漂移影响（`tests/allocations.rs` 用计数分配器）：
+//!
+//! | `line_hashes_pure` | 分配次数 |
+//! |---|---|
+//! | 1000 行 | 11 |
+//! | 20000 行 | 16 |
+//!
+//! 行数涨 20 倍而分配次数几乎不动；旧表示下这里是两万多次。同机这一项从 367.1µs 降到
+//! 158.5µs。
+//!
+//! 但**端到端编辑路径没有跟着受益**：完整 replace 从 1431.5µs 到 1403.7µs，落在噪声里。
+//! 原因有两层：
+//!
+//! 1. `replace` 走的是 `precomputed_hashes`，根本不调用 `line_hashes_pure`。这一项的收益
+//!    落在**首次读入一个文件**上（`read` 工具，以及某个文件的第一次 `replace`）。
+//! 2. 编辑路径的大头是按内容分组的哈希表查找与 diff 生成，锚点分配只占其中一小块。
+//!
+//! 上面这组数字是**跨轮次**比较，不是严格 A/B：「改动前」那一列是上一轮改动时测的。
+//! 对照组 `canon`（这次改动碰不到它）同机从 37.2µs 漂到 33.1µs，即本轮机器状态快约 11%，
+//! 所以 `replace` 那 2% 的「提升」不能算数。要严格对照，得像换哈希器那次一样把旧表示的
+//! 二进制也编出来交替跑。
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt};
 
 use astrcode_ext_common::arena::with_scratch;
 use bumpalo::Bump;
 use bumpalo::collections::Vec as ArenaVec;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, Visitor},
+};
 
 use super::{
     error::{EditError, ErrorCode},
@@ -77,34 +108,130 @@ const HASH_PROBE_STRIDE: usize = ALPH_SIZE * ALPH_SIZE + ALPH_SIZE + 1;
 /// 位图需要的 u32 个数。
 const BITSET_WORDS: usize = HASH_SPACE.div_ceil(32);
 
+/// 一个 3 字符锚点 —— 行的地址。
+///
+/// 表示成 `[u8; 3]` 而不是 `String`，是为了让整份文件的锚点向量退化成**一次**分配：
+/// `Vec<Anchor>` 就是 3N 字节的连续缓冲，而 `Vec<String>` 是 N 次小分配。编辑路径上
+/// 每行一次 malloc 正是常驻内存高水位的来源。
+///
+/// 布局与 `Box<[u8]>` 完全相同，但保留了 `hashes[i]` 索引（返回 `&Anchor`），调用方
+/// 只需换类型，不必改索引写法。
+///
+/// 磁盘形状仍是「3 字符字符串的数组」（见下面的手写 serde）：derive 会把 `[u8; 3]`
+/// 写成数字数组 `[97,66,51]`，那是破坏格式。`Ord` 按字节序导出，与 `String` 的字节序
+/// 一致，所以以锚点为键的 `BTreeSet`（`served`）迭代顺序不变。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Anchor([u8; HASH_LEN]);
+
+impl AsRef<str> for Anchor {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Anchor {
+    /// 从字面锚点构造；长度或字母表不符时 panic。
+    ///
+    /// 是 `const fn`，所以测试里把锚点写错会在编译期就报错。
+    pub const fn new(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        assert!(bytes.len() == HASH_LEN, "锚点必须是 3 个字符");
+        let mut out = [0u8; HASH_LEN];
+        let mut index = 0;
+        while index < HASH_LEN {
+            let byte = bytes[index];
+            assert!(byte.is_ascii_alphanumeric(), "锚点只能是 ASCII 字母数字");
+            out[index] = byte;
+            index += 1;
+        }
+        Self(out)
+    }
+
+    /// 校验并构造；不是合法锚点时返回 `None`。
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() != HASH_LEN || !text.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return None;
+        }
+        let mut out = [0u8; HASH_LEN];
+        out.copy_from_slice(text.as_bytes());
+        Some(Self(out))
+    }
+
+    /// 零拷贝的字符串视图。锚点恒为 ASCII，UTF-8 校验不会失败。
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("锚点恒为 ASCII")
+    }
+
+    /// 62 进制解码出的序号。
+    pub fn index(&self) -> usize {
+        let mut index = 0usize;
+        for byte in self.0 {
+            let position = ALPH
+                .iter()
+                .position(|&candidate| candidate == byte)
+                .expect("锚点字符必在字母表内");
+            index = index * ALPH_SIZE + position;
+        }
+        index
+    }
+}
+
+impl fmt::Display for Anchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Debug for Anchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Anchor({})", self.as_str())
+    }
+}
+
+impl Serialize for Anchor {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Anchor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AnchorVisitor;
+
+        impl<'a> Visitor<'a> for AnchorVisitor {
+            type Value = Anchor;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("一个 3 字符的哈希锚点")
+            }
+
+            fn visit_str<E: DeError>(self, value: &str) -> Result<Anchor, E> {
+                Anchor::parse(value).ok_or_else(|| E::custom("锚点必须是 3 个 ASCII 字母数字字符"))
+            }
+        }
+
+        deserializer.deserialize_str(AnchorVisitor)
+    }
+}
+
 /// 判断一个字符串是不是合法的裸锚点。
 pub fn is_hash(text: &str) -> bool {
-    text.len() == HASH_LEN && text.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    Anchor::parse(text).is_some()
 }
 
 /// 把序号渲染成 3 字符锚点（大端 62 进制）。
-pub fn idx_to_hash(mut index: usize) -> String {
+pub fn idx_to_hash(mut index: usize) -> Anchor {
     let mut out = [0u8; HASH_LEN];
     for slot in out.iter_mut().rev() {
         *slot = ALPH[index % ALPH_SIZE];
         index /= ALPH_SIZE;
     }
-    std::str::from_utf8(&out)
-        .expect("ALPH 是 ASCII")
-        .to_owned()
+    Anchor(out)
 }
 
 /// [`idx_to_hash`] 的逆运算；不是合法锚点时返回 `None`。
 pub fn hash_to_index(hash: &str) -> Option<usize> {
-    if hash.len() != HASH_LEN {
-        return None;
-    }
-    let mut index = 0usize;
-    for byte in hash.bytes() {
-        let position = ALPH.iter().position(|&candidate| candidate == byte)?;
-        index = index * ALPH_SIZE + position;
-    }
-    Some(index)
+    Anchor::parse(hash).map(|anchor| anchor.index())
 }
 
 /// 内容派生的基址。
@@ -171,17 +298,16 @@ impl Assigner {
     }
 
     /// 占位并推进探测提示（用于「原样保留」的锚点）。
-    fn occupy_hash(&mut self, hash: &str) {
-        if let Some(index) = hash_to_index(hash) {
-            self.used.set(index);
-            if index + HASH_PROBE_STRIDE > self.hint {
-                self.hint = index + HASH_PROBE_STRIDE;
-            }
+    fn occupy_hash(&mut self, hash: Anchor) {
+        let index = hash.index();
+        self.used.set(index);
+        if index + HASH_PROBE_STRIDE > self.hint {
+            self.hint = index + HASH_PROBE_STRIDE;
         }
     }
 
     /// 为 `base` 分配一个唯一锚点：基址空闲就直接用，否则探测下一个空位。
-    fn assign(&mut self, base: usize) -> Result<String, EditError> {
+    fn assign(&mut self, base: usize) -> Result<Anchor, EditError> {
         if !self.used.get(base) {
             self.used.set(base);
             self.hint = base + HASH_PROBE_STRIDE;
@@ -207,7 +333,7 @@ fn anchor_space_exhausted() -> EditError {
 }
 
 /// 为整个文件重新分配锚点。相同内容永远得到相同结果。
-pub fn line_hashes_pure(content: &str) -> Result<Vec<String>, EditError> {
+pub fn line_hashes_pure(content: &str) -> Result<Vec<Anchor>, EditError> {
     let lines = split_lines(content);
     let mut assigner = Assigner::new();
     let mut hashes = Vec::with_capacity(lines.len());
@@ -227,10 +353,10 @@ pub fn line_hashes_pure(content: &str) -> Result<Vec<String>, EditError> {
 /// 3. 剩下的行重新按内容派生基址分配。
 pub fn map_stable_hashes(
     old_content: &str,
-    old_hashes: &[String],
+    old_hashes: &[Anchor],
     new_content: &str,
-    removed_hashes: &FxHashSet<String>,
-) -> Result<Vec<String>, EditError> {
+    removed_hashes: &FxHashSet<Anchor>,
+) -> Result<Vec<Anchor>, EditError> {
     // 下面两张查找表都是调用内部的临时量，返回前整体复位。
     with_scratch(|bump| {
         map_stable_hashes_in(bump, old_content, old_hashes, new_content, removed_hashes)
@@ -240,21 +366,19 @@ pub fn map_stable_hashes(
 fn map_stable_hashes_in(
     bump: &Bump,
     old_content: &str,
-    old_hashes: &[String],
+    old_hashes: &[Anchor],
     new_content: &str,
-    removed_hashes: &FxHashSet<String>,
-) -> Result<Vec<String>, EditError> {
+    removed_hashes: &FxHashSet<Anchor>,
+) -> Result<Vec<Anchor>, EditError> {
     let old_lines = split_lines(old_content);
     let new_lines = split_lines(new_content);
-    let mut new_hashes: Vec<Option<String>> = vec![None; new_lines.len()];
+    let mut new_hashes: Vec<Option<Anchor>> = vec![None; new_lines.len()];
     let mut assigner = Assigner::new();
 
     let mut old_hash_index: FxHashMap<&str, usize> = FxHashMap::default();
     for (index, hash) in old_hashes.iter().enumerate() {
         old_hash_index.insert(hash.as_str(), index);
-        if let Some(slot) = hash_to_index(hash) {
-            assigner.occupy(slot);
-        }
+        assigner.occupy(hash.index());
     }
 
     let removed_indexes: FxHashSet<usize> = removed_hashes
@@ -313,11 +437,11 @@ fn map_stable_hashes_in(
         };
         let new_index = candidates.remove(position);
         new_hashes[new_index] = Some(old_hashes[index].clone());
-        assigner.occupy_hash(&old_hashes[index]);
+        assigner.occupy_hash(old_hashes[index]);
     }
 
     // 被删行的锚点按内容排队，供新内容里同内容的行继承。
-    let mut removed_by_content: FxHashMap<Cow<'_, str>, (Vec<String>, usize)> =
+    let mut removed_by_content: FxHashMap<Cow<'_, str>, (Vec<Anchor>, usize)> =
         FxHashMap::default();
     for &index in &removed_entries {
         let entry = removed_by_content
@@ -379,8 +503,13 @@ fn nearest_new(candidates: &[usize], target: isize) -> Option<usize> {
 mod tests {
     use super::*;
 
-    fn hashes(content: &str) -> Vec<String> {
+    fn hashes(content: &str) -> Vec<Anchor> {
         line_hashes_pure(content).expect("分配锚点失败")
+    }
+
+    /// 把字面锚点列表转成锚点向量，让金标准用例里的期望值保持可读。
+    fn anchors(texts: &[&str]) -> Vec<Anchor> {
+        texts.iter().map(|text| Anchor::new(text)).collect()
     }
 
     #[test]
@@ -389,9 +518,9 @@ mod tests {
         let anchors = hashes(content);
         assert_eq!(anchors.len(), 4);
         for anchor in &anchors {
-            assert!(is_hash(anchor), "{anchor} 不是合法锚点");
+            assert!(is_hash(anchor.as_str()), "{anchor} 不是合法锚点");
         }
-        let unique: FxHashSet<&String> = anchors.iter().collect();
+        let unique: FxHashSet<&Anchor> = anchors.iter().collect();
         assert_eq!(unique.len(), anchors.len());
     }
 
@@ -405,7 +534,7 @@ mod tests {
     fn blank_line_runs_still_get_unique_anchors() {
         let content = "a\n\n\n\n\nb\n";
         let anchors = hashes(content);
-        let unique: FxHashSet<&String> = anchors.iter().collect();
+        let unique: FxHashSet<&Anchor> = anchors.iter().collect();
         assert_eq!(unique.len(), anchors.len());
         assert_eq!(anchors.len(), 6);
     }
@@ -417,7 +546,7 @@ mod tests {
             .collect();
         let anchors = hashes(&content);
         assert_eq!(anchors.len(), 5000);
-        let unique: FxHashSet<&String> = anchors.iter().collect();
+        let unique: FxHashSet<&Anchor> = anchors.iter().collect();
         assert_eq!(unique.len(), 5000);
     }
 
@@ -425,7 +554,8 @@ mod tests {
     fn idx_to_hash_and_hash_to_index_round_trip() {
         for index in [0usize, 1, 61, 62, 3843, HASH_SPACE - 1] {
             let hash = idx_to_hash(index);
-            assert_eq!(hash_to_index(&hash), Some(index));
+            assert_eq!(hash.index(), index);
+            assert_eq!(hash_to_index(hash.as_str()), Some(index));
         }
         assert_eq!(hash_to_index("aB"), None);
         assert_eq!(hash_to_index("aB3x"), None);
@@ -446,7 +576,7 @@ mod tests {
         let old_content = "one\ntwo\nthree\nfour\nfive\n";
         let old_hashes = hashes(old_content);
         let new_content = "one\ntwo\nTHREE\nfour\nfive\n";
-        let removed: FxHashSet<String> = [old_hashes[2].clone()].into_iter().collect();
+        let removed: FxHashSet<Anchor> = [old_hashes[2]].into_iter().collect();
         let new_hashes =
             map_stable_hashes(old_content, &old_hashes, new_content, &removed).expect("映射失败");
 
@@ -454,7 +584,7 @@ mod tests {
         assert_eq!(new_hashes[1], old_hashes[1]);
         assert_eq!(new_hashes[3], old_hashes[3]);
         assert_eq!(new_hashes[4], old_hashes[4]);
-        let unique: FxHashSet<&String> = new_hashes.iter().collect();
+        let unique: FxHashSet<&Anchor> = new_hashes.iter().collect();
         assert_eq!(unique.len(), new_hashes.len());
     }
 
@@ -463,14 +593,14 @@ mod tests {
         let old_content = "a\nb\nc\n";
         let old_hashes = hashes(old_content);
         let new_content = "a\nb\nB2\nc\n";
-        let removed: FxHashSet<String> = [old_hashes[1].clone()].into_iter().collect();
+        let removed: FxHashSet<Anchor> = [old_hashes[1]].into_iter().collect();
         let new_hashes =
             map_stable_hashes(old_content, &old_hashes, new_content, &removed).expect("映射失败");
 
         assert_eq!(new_hashes.len(), 4);
         assert_eq!(new_hashes[0], old_hashes[0]);
         assert_eq!(new_hashes[3], old_hashes[2]);
-        let unique: FxHashSet<&String> = new_hashes.iter().collect();
+        let unique: FxHashSet<&Anchor> = new_hashes.iter().collect();
         assert_eq!(unique.len(), 4);
     }
 
@@ -479,7 +609,7 @@ mod tests {
     fn map_stable_hashes_reuses_removed_anchors_for_same_content() {
         let old_content = "a\nb\nc\n";
         let old_hashes = hashes(old_content);
-        let removed: FxHashSet<String> = [old_hashes[1].clone()].into_iter().collect();
+        let removed: FxHashSet<Anchor> = [old_hashes[1]].into_iter().collect();
         let new_hashes =
             map_stable_hashes(old_content, &old_hashes, "a\nb\nc\n", &removed).expect("映射失败");
         assert_eq!(new_hashes, old_hashes);
@@ -503,17 +633,17 @@ mod tests {
     fn matches_the_original_implementation() {
         assert_eq!(
             hashes("function hello() {\n  console.log(\"world\");\n}\n\n// end\n"),
-            ["EuR", "AZx", "AU6", "AuN", "BNk"]
+            anchors(&["EuR", "AZx", "AU6", "AuN", "BNk"])
         );
-        assert_eq!(hashes(""), ["AuN"]);
+        assert_eq!(hashes(""), anchors(&["AuN"]));
         assert_eq!(
             hashes("a\n\n\n\n\nb\n"),
-            ["Wot", "AuN", "BvO", "CwP", "DxQ", "rKa"]
+            anchors(&["Wot", "AuN", "BvO", "CwP", "DxQ", "rKa"])
         );
-        assert_eq!(hashes("错\n误\n"), ["TAJ", "A9H"]);
+        assert_eq!(hashes("错\n误\n"), anchors(&["TAJ", "A9H"]));
         assert_eq!(
             hashes(&format!("{}\n{}\n", "x".repeat(300), "y".repeat(300))),
-            ["hXb", "TSA"]
+            anchors(&["hXb", "TSA"])
         );
     }
 
@@ -522,7 +652,7 @@ mod tests {
     fn stable_mapping_matches_the_original_implementation() {
         let old_content = "one\ntwo\nthree\nfour\nfive\n";
         let old_hashes = hashes(old_content);
-        let removed: FxHashSet<String> = [old_hashes[2].clone()].into_iter().collect();
+        let removed: FxHashSet<Anchor> = [old_hashes[2]].into_iter().collect();
         assert_eq!(
             map_stable_hashes(
                 old_content,
@@ -531,17 +661,17 @@ mod tests {
                 &removed
             )
             .expect("映射失败"),
-            ["hvX", "n4z", "BHz", "N4i", "LKH"]
+            anchors(&["hvX", "n4z", "BHz", "N4i", "LKH"])
         );
 
         let old_content = "a\nb\nc\n";
         let old_hashes = hashes(old_content);
-        assert_eq!(old_hashes, ["Wot", "rKa", "BkM"]);
-        let removed: FxHashSet<String> = [old_hashes[1].clone()].into_iter().collect();
+        assert_eq!(old_hashes, anchors(&["Wot", "rKa", "BkM"]));
+        let removed: FxHashSet<Anchor> = [old_hashes[1]].into_iter().collect();
         assert_eq!(
             map_stable_hashes(old_content, &old_hashes, "a\nb\nB2\nc\n", &removed)
                 .expect("映射失败"),
-            ["Wot", "rKa", "Bo2", "BkM"]
+            anchors(&["Wot", "rKa", "Bo2", "BkM"])
         );
     }
 

@@ -17,5 +17,5 @@ pub mod request;
 pub mod xxh32;
 
 pub use error::{EditError, ErrorCode};
-pub use hash::{HASH_LEN, HASH_SEP};
+pub use hash::{Anchor, HASH_LEN, HASH_SEP};
 pub use request::{EditRequest, HashRef, RawEdit};

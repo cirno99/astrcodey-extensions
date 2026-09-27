@@ -5,7 +5,15 @@
 //! - `snapshots` —— 内容校验和 → 锚点数组。命中就不必重算 238328 位位图，链式编辑
 //!   才够快。上限 256 条，超出按插入顺序淘汰最旧一条。
 //! - `served` —— 该文件里**展示给过模型**的锚点。served 守卫靠它拦住凭空编造的地址。
-//! - `undo` —— 每个文件最后一次 `replace` 的还原点，重启后仍可回滚。
+//!   上限 [`SERVED_CAP`] 条，超出按最近使用顺序淘汰最旧一条。
+//! - `undo` —— 每个文件最后一次 `replace` 的还原点，重启后仍可回滚。上限 [`UNDO_CAP`]
+//!   条，超出按最近使用顺序淘汰最旧一条；每条存的是被编辑文件的两份全文，是状态文件里
+//!   最大的一块，因此这个上限比另外两个紧得多。
+//!
+//! 后两份都按「文件」淘汰整条记录，而不是在文件内淘汰单个锚点：`served` 在文件内天然
+//! 被该文件的行数界定（只有展示过的行才会进来），而在文件内淘汰单个锚点会让守卫把确实
+//! 展示过的地址判成伪造。淘汰整条则让 `served_set` 返回 `None`，`apply_edit` 对 `None`
+//! 是**跳过**守卫——方向是安全的（编辑照常成功，只是少一层防伪造检查）。
 //!
 //! # 与原版的一处架构差异
 //!
@@ -27,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use crate::hashline::{
     HASH_LEN, HASH_SEP,
     error::EditError,
-    hash::line_hashes_pure,
+    hash::{Anchor, line_hashes_pure},
     lines::{Ending, split_lines},
     xxh32::content_checksum,
 };
@@ -38,6 +46,10 @@ const SESSIONS_DIR: &str = "sessions";
 const STATE_FILE: &str = "state.json";
 /// 快照缓存条数上限（按路径）。
 const SNAPSHOT_CAP: usize = 256;
+/// served 集合条数上限（按路径）。文件内不设上限，理由见模块文档。
+const SERVED_CAP: usize = 256;
+/// 还原点条数上限（按路径）。
+const UNDO_CAP: usize = 32;
 /// 状态文件格式版本。
 const STATE_VERSION: u32 = 1;
 
@@ -55,7 +67,9 @@ pub struct Snapshot {
     pub checksum: String,
     #[serde(rename = "lineCount")]
     pub line_count: usize,
-    pub hashes: Vec<String>,
+    /// 锚点向量。用 `Arc` 共享：命中快照缓存时只加一次引用计数，不再深拷贝整份锚点。
+    /// 每行一个 3 字节的 [`Anchor`]，整份向量因此是**一次**分配，而不是每行一次。
+    pub hashes: Arc<Vec<Anchor>>,
 }
 
 /// 一次 `replace` 的还原点。
@@ -69,8 +83,8 @@ pub struct UndoRecord {
     /// 原文件的行尾，取值为字面量 `"\n"` / `"\r\n"` / `"\r"`。
     #[serde(default = "default_ending_literal")]
     pub ending: String,
-    /// 编辑前内容的锚点。
-    pub hashes: Vec<String>,
+    /// 编辑前内容的锚点。与 `snapshots` 里的那份共享同一块内存。
+    pub hashes: Arc<Vec<Anchor>>,
     /// 编辑后写入文件的内容（LF 归一、不含 BOM），用于判断文件是否被外部改过。
     #[serde(rename = "resultContent")]
     pub result_content: String,
@@ -87,6 +101,24 @@ fn default_ending_literal() -> String {
     "\n".to_owned()
 }
 
+/// 重建 LRU 顺序表。
+///
+/// 磁盘上记了顺序就用它；表里缺的键排在最后（按 key 序，只求确定）。旧格式的状态文件
+/// 没有这两张表，于是整体退回按 key 序——不精确，但只影响「上限被顶满时先淘汰谁」。
+fn restore_order<'a>(
+    saved: Vec<String>,
+    keys: impl Iterator<Item = &'a String>,
+) -> VecDeque<String> {
+    let mut order: VecDeque<String> = saved.into_iter().collect();
+    let mut extra: Vec<String> = keys
+        .filter(|key| !order.contains(*key))
+        .cloned()
+        .collect();
+    extra.sort();
+    order.extend(extra);
+    order
+}
+
 /// 状态文件的线缆形状。键名沿用原版，便于两边对照。
 #[derive(Debug, Serialize, Deserialize)]
 struct StateFile {
@@ -97,9 +129,33 @@ struct StateFile {
     #[serde(default)]
     snapshots: BTreeMap<String, Snapshot>,
     #[serde(default)]
-    served: BTreeMap<String, BTreeSet<String>>,
+    served: BTreeMap<String, BTreeSet<Anchor>>,
+    /// served 的最近使用顺序，淘汰最旧一条时用。
+    #[serde(default, rename = "servedOrder")]
+    served_order: Vec<String>,
     #[serde(default)]
     undo: BTreeMap<String, UndoRecord>,
+    /// undo 的最近使用顺序，淘汰最旧一条时用。
+    #[serde(default, rename = "undoOrder")]
+    undo_order: Vec<String>,
+}
+
+/// 写盘时的借用视图。
+///
+/// 与 [`StateFile`] 分开，是为了让 `save()` 不必先深拷贝一份状态：大会话的 `undo` 存着
+/// 被编辑文件的两份全文，`snapshots` 存着几万个锚点，每次工具调用都克隆一遍，等于把
+/// 这次调用的内存峰值直接抬高一个状态副本。这里只借用，不拥有。
+///
+/// 线缆形状与 [`StateFile`] 完全一致，读回来还是按 `StateFile` 解。
+#[derive(Debug, Serialize)]
+struct StateFileRef<'a> {
+    version: u32,
+    order: Vec<&'a str>,
+    snapshots: &'a BTreeMap<String, Snapshot>,
+    served: &'a BTreeMap<String, BTreeSet<Anchor>>,
+    served_order: Vec<&'a str>,
+    undo: &'a BTreeMap<String, UndoRecord>,
+    undo_order: Vec<&'a str>,
 }
 
 /// 一个会话的可变状态。
@@ -108,8 +164,10 @@ pub struct SessionState {
     path: PathBuf,
     snapshots: BTreeMap<String, Snapshot>,
     snapshot_order: VecDeque<String>,
-    served: BTreeMap<String, BTreeSet<String>>,
+    served: BTreeMap<String, BTreeSet<Anchor>>,
+    served_order: VecDeque<String>,
     undo: BTreeMap<String, UndoRecord>,
+    undo_order: VecDeque<String>,
     dirty: bool,
 }
 
@@ -122,7 +180,9 @@ impl SessionState {
             snapshots: BTreeMap::new(),
             snapshot_order: VecDeque::new(),
             served: BTreeMap::new(),
+            served_order: VecDeque::new(),
             undo: BTreeMap::new(),
+            undo_order: VecDeque::new(),
             dirty: false,
         };
 
@@ -147,7 +207,9 @@ impl SessionState {
         };
         state.snapshots = file.snapshots;
         state.served = file.served;
+        state.served_order = restore_order(file.served_order, state.served.keys());
         state.undo = file.undo;
+        state.undo_order = restore_order(file.undo_order, state.undo.keys());
         state
     }
 
@@ -156,22 +218,25 @@ impl SessionState {
     }
 
     /// 取某个文件的锚点：命中快照缓存就直接用，否则重算并写回缓存。
-    pub fn hashes_for(&mut self, key: &str, content: &str) -> Result<Vec<String>, EditError> {
+    ///
+    /// 返回 `Arc` 而不是 `Vec<Anchor>`：调用方（read / replace）要的只是只读视图，深拷贝
+    /// 一份几千元素的锚点向量纯属浪费，而它正是常驻内存高水位的来源之一。
+    pub fn hashes_for(&mut self, key: &str, content: &str) -> Result<Arc<Vec<Anchor>>, EditError> {
         let checksum = content_checksum(content);
         let line_count = split_lines(content).len();
         if let Some(snapshot) = self.snapshots.get(key)
             && snapshot.checksum == checksum
             && snapshot.line_count == line_count
         {
-            return Ok(snapshot.hashes.clone());
+            return Ok(Arc::clone(&snapshot.hashes));
         }
-        let hashes = line_hashes_pure(content)?;
-        self.put_snapshot(key, content, hashes.clone());
+        let hashes = Arc::new(line_hashes_pure(content)?);
+        self.put_snapshot(key, content, Arc::clone(&hashes));
         Ok(hashes)
     }
 
     /// 覆盖某个文件的锚点快照。
-    pub fn put_snapshot(&mut self, key: &str, content: &str, hashes: Vec<String>) {
+    pub fn put_snapshot(&mut self, key: &str, content: &str, hashes: Arc<Vec<Anchor>>) {
         if !self.snapshots.contains_key(key) {
             self.snapshot_order.push_back(key.to_owned());
         }
@@ -192,20 +257,50 @@ impl SessionState {
     }
 
     /// 某个文件已经展示给模型的锚点集合。
-    pub fn served_set(&self, key: &str) -> Option<&BTreeSet<String>> {
+    pub fn served_set(&self, key: &str) -> Option<&BTreeSet<Anchor>> {
         self.served.get(key)
     }
 
     /// 记下「这些锚点已经展示给模型了」。
-    pub fn record_served(&mut self, key: &str, hashes: &[String]) {
+    ///
+    /// 文件内**不设**条数上限：集合天然被该文件的行数界定（只有展示过的行才会进来），
+    /// 不是泄漏。若在文件内淘汰单个锚点，守卫会把「确实展示过」的地址判成伪造——那是
+    /// fail-closed，方向错了。这里只按文件做 LRU 淘汰，让 `served_set` 返回 `None`，
+    /// 而 `apply_edit` 对 `None` 是跳过守卫，编辑照常成功。
+    pub fn record_served(&mut self, key: &str, hashes: &[Anchor]) {
         if hashes.is_empty() {
             return;
         }
         let entry = self.served.entry(key.to_owned()).or_default();
         let before = entry.len();
-        entry.extend(hashes.iter().cloned());
+        entry.extend(hashes.iter().copied());
         if entry.len() != before {
             self.dirty = true;
+        }
+        self.touch_served(key);
+    }
+
+    /// 把 `key` 推到 served 的最近使用端，并按 [`SERVED_CAP`] 淘汰最旧的文件。
+    fn touch_served(&mut self, key: &str) {
+        self.served_order.retain(|existing| existing != key);
+        self.served_order.push_back(key.to_owned());
+        while self.served_order.len() > SERVED_CAP {
+            if let Some(oldest) = self.served_order.pop_front() {
+                self.served.remove(&oldest);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// 把 `key` 推到 undo 的最近使用端，并按 [`UNDO_CAP`] 淘汰最旧的文件。
+    fn touch_undo(&mut self, key: &str) {
+        self.undo_order.retain(|existing| existing != key);
+        self.undo_order.push_back(key.to_owned());
+        while self.undo_order.len() > UNDO_CAP {
+            if let Some(oldest) = self.undo_order.pop_front() {
+                self.undo.remove(&oldest);
+                self.dirty = true;
+            }
         }
     }
 
@@ -224,13 +319,19 @@ impl SessionState {
     }
 
     /// 覆盖某个文件的还原点，返回被替换掉的上一条（写入失败时用于回滚）。
+    ///
+    /// 超过 [`UNDO_CAP`] 时按最近使用顺序淘汰最旧的**其他**文件：被淘汰的文件再调
+    /// `undo_last_replace` 会报「没有还原点」。这是刻意的——每条还原点存着两份全文，
+    /// 不设上限就是状态文件里最大的一块。
     pub fn set_undo(&mut self, key: &str, record: UndoRecord) -> Option<UndoRecord> {
         self.dirty = true;
+        self.touch_undo(key);
         self.undo.insert(key.to_owned(), record)
     }
 
     /// 丢弃某个文件的还原点。
     pub fn clear_undo(&mut self, key: &str) -> Option<UndoRecord> {
+        self.undo_order.retain(|existing| existing != key);
         let removed = self.undo.remove(key);
         if removed.is_some() {
             self.dirty = true;
@@ -244,12 +345,14 @@ impl SessionState {
             return Ok(());
         }
         self.dirty = false;
-        let file = StateFile {
+        let file = StateFileRef {
             version: STATE_VERSION,
-            order: self.snapshot_order.iter().cloned().collect(),
-            snapshots: self.snapshots.clone(),
-            served: self.served.clone(),
-            undo: self.undo.clone(),
+            order: self.snapshot_order.iter().map(String::as_str).collect(),
+            snapshots: &self.snapshots,
+            served: &self.served,
+            served_order: self.served_order.iter().map(String::as_str).collect(),
+            undo: &self.undo,
+            undo_order: self.undo_order.iter().map(String::as_str).collect(),
         };
         let payload = astrcode_ext_common::json::to_string(&file)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
@@ -265,7 +368,7 @@ impl SessionState {
 }
 
 /// 从 diff 正文里抽出 `+`/` ` 行的锚点。
-fn served_hashes_in_diff(diff: &str) -> Vec<String> {
+fn served_hashes_in_diff(diff: &str) -> Vec<Anchor> {
     let prefix_len = HASH_LEN + HASH_SEP.len_utf8();
     diff.split('\n')
         .filter_map(|line| {
@@ -281,7 +384,7 @@ fn served_hashes_in_diff(diff: &str) -> Vec<String> {
             }
             rest[HASH_LEN..]
                 .starts_with(HASH_SEP)
-                .then(|| rest[..HASH_LEN].to_owned())
+                .then(|| Anchor::parse(&rest[..HASH_LEN]).expect("上面已校验过字符集"))
         })
         .collect()
 }
@@ -344,7 +447,11 @@ mod tests {
     fn snapshots_are_evicted_in_insertion_order_past_the_cap() {
         let mut state = temp_state("evict");
         for index in 0..SNAPSHOT_CAP + 5 {
-            state.put_snapshot(&format!("file{index}.txt"), "x\n", vec!["aB3".into()]);
+            state.put_snapshot(
+                &format!("file{index}.txt"),
+                "x\n",
+                Arc::new(vec![Anchor::new("aB3")]),
+            );
         }
         assert_eq!(state.snapshots.len(), SNAPSHOT_CAP);
         assert!(!state.snapshots.contains_key("file0.txt"));
@@ -356,23 +463,23 @@ mod tests {
     #[test]
     fn re_putting_an_existing_key_does_not_reset_its_age() {
         let mut state = temp_state("age");
-        state.put_snapshot("first.txt", "x\n", vec!["aB3".into()]);
+        state.put_snapshot("first.txt", "x\n", Arc::new(vec![Anchor::new("aB3")]));
         for index in 0..SNAPSHOT_CAP - 1 {
-            state.put_snapshot(&format!("f{index}.txt"), "x\n", vec!["aB3".into()]);
+            state.put_snapshot(&format!("f{index}.txt"), "x\n", Arc::new(vec![Anchor::new("aB3")]));
         }
         // 再写一次最早的键：原版 Map.set 不改变已有键的位置，这里保持一致
-        state.put_snapshot("first.txt", "y\n", vec!["cD4".into()]);
+        state.put_snapshot("first.txt", "y\n", Arc::new(vec![Anchor::new("cD4")]));
         assert_eq!(state.snapshot_order.front().map(String::as_str), Some("first.txt"));
     }
 
     #[test]
     fn record_served_accumulates_and_dedupes() {
         let mut state = temp_state("served");
-        state.record_served("a.txt", &["aB3".into(), "cD4".into()]);
-        state.record_served("a.txt", &["cD4".into(), "eF5".into()]);
+        state.record_served("a.txt", &[Anchor::new("aB3"), Anchor::new("cD4")]);
+        state.record_served("a.txt", &[Anchor::new("cD4"), Anchor::new("eF5")]);
         let served = state.served_set("a.txt").expect("应当有记录");
         assert_eq!(served.len(), 3);
-        assert!(served.contains("eF5"));
+        assert!(served.contains(&Anchor::new("eF5")));
         // 空输入不改动任何东西
         state.record_served("b.txt", &[]);
         assert!(state.served_set("b.txt").is_none());
@@ -384,7 +491,7 @@ mod tests {
             " {}{HASH_SEP}context\n-{}{HASH_SEP}gone\n+{}{HASH_SEP}added\n ...",
             "aB3", "cD4", "eF5"
         );
-        assert_eq!(served_hashes_in_diff(&diff), ["aB3", "eF5"]);
+        assert_eq!(served_hashes_in_diff(&diff), [Anchor::new("aB3"), Anchor::new("eF5")]);
     }
 
     #[test]
@@ -482,8 +589,126 @@ mod tests {
         let mut state = temp_state("align");
         let content = "a\nb\nc\n";
         let hashes = line_hashes_pure(content).expect("分配失败");
-        state.put_snapshot("a.txt", content, hashes.clone());
+        state.put_snapshot("a.txt", content, Arc::new(hashes.clone()));
         assert_eq!(state.snapshots["a.txt"].line_count, 3);
-        assert_eq!(state.hashes_for("a.txt", content).expect("计算失败"), hashes);
+        assert_eq!(
+            state.hashes_for("a.txt", content).expect("计算失败").as_slice(),
+            hashes.as_slice()
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_shares_the_snapshot_anchors_instead_of_copying_them() {
+        let mut state = temp_state("share");
+        let content = "a\nb\nc\n";
+        let hashes = Arc::new(line_hashes_pure(content).expect("分配失败"));
+        state.put_snapshot("a.txt", content, Arc::clone(&hashes));
+
+        // 缓存命中返回的必须**就是**快照里那一份，而不是它的副本：每行一个 `String`，
+        // 拷一次就是几千次小分配，常驻内存的高水位正是这么堆出来的。
+        let fetched = state.hashes_for("a.txt", content).expect("计算失败");
+        assert!(Arc::ptr_eq(&fetched, &state.snapshots["a.txt"].hashes));
+    }
+
+    /// 造一条最小可用的还原点。
+    fn undo_record() -> UndoRecord {
+        UndoRecord {
+            content: "a\n".to_owned(),
+            bom: String::new(),
+            ending: "\n".to_owned(),
+            hashes: Arc::new(vec![Anchor::new("aB3")]),
+            result_content: "b\n".to_owned(),
+        }
+    }
+
+    /// 线缆格式兼容：上一版写出的状态文件必须还能读，而且重新落盘后形状不变。
+    ///
+    /// 这条断言专门盯着 `Anchor` 的 serde：derive 会把 `[u8; 3]` 写成数字数组
+    /// `[97,66,51]`，读得回来但旧版本读不回去 —— 那就是破坏格式。
+    #[test]
+    fn a_state_file_written_by_the_previous_format_still_loads() {
+        let path = temp_state("wire").path().clone();
+
+        // 旧形状：锚点是 3 字符字符串数组，没有两张顺序表。
+        let legacy = r#"{"version":1,"order":["a.txt"],"snapshots":{"a.txt":{"checksum":"x","lineCount":3,"hashes":["aB3","cD4","eF5"]}},"served":{"a.txt":["aB3"]},"undo":{"a.txt":{"content":"a\nb\nc\n","bom":"","ending":"\n","hashes":["aB3","cD4","eF5"],"resultContent":"a\nB\nc\n"}}}"#;
+        std::fs::write(&path, legacy).expect("写入失败");
+
+        let mut state = SessionState::load(path.clone());
+        let served: Vec<&str> = state
+            .served_set("a.txt")
+            .expect("应当有记录")
+            .iter()
+            .map(Anchor::as_str)
+            .collect();
+        assert_eq!(served, ["aB3"]);
+        let record = state.undo_record("a.txt").expect("应当留下还原点");
+        assert_eq!(record.hashes.len(), 3);
+        assert_eq!(record.hashes[0].as_str(), "aB3");
+
+        state.put_snapshot(
+            "a.txt",
+            "a\nb\nc\n",
+            Arc::new(line_hashes_pure("a\nb\nc\n").expect("分配失败")),
+        );
+        state.save().expect("写盘失败");
+
+        let saved = std::fs::read_to_string(&path).expect("读取失败");
+        assert!(saved.contains(r#""hashes":["aB3","cD4","eF5"]"#), "{saved}");
+        assert!(saved.contains(r#""served":{"a.txt":["aB3"]}"#), "{saved}");
+        assert!(!saved.contains("[97,"), "{saved}");
+    }
+
+    #[test]
+    fn served_entries_are_evicted_by_recent_use_past_the_cap() {
+        let mut state = temp_state("served-cap");
+        for index in 0..SERVED_CAP + 5 {
+            state.record_served(&format!("f{index}.txt"), &[Anchor::new("aB3")]);
+        }
+        assert_eq!(state.served.len(), SERVED_CAP);
+        assert_eq!(state.served_order.len(), SERVED_CAP);
+        assert!(!state.served.contains_key("f0.txt"));
+        assert!(state.served.contains_key(&format!("f{}.txt", SERVED_CAP + 4)));
+
+        // 再碰一次最旧的那个键，它就该被保下来，轮到它后面的键被淘汰
+        state.record_served("f5.txt", &[Anchor::new("cD4")]);
+        state.record_served("f999.txt", &[Anchor::new("aB3")]);
+        assert!(state.served.contains_key("f5.txt"));
+        assert!(!state.served.contains_key("f6.txt"));
+    }
+
+    #[test]
+    fn undo_records_are_evicted_by_recent_use_past_the_cap() {
+        let mut state = temp_state("undo-cap");
+        for index in 0..UNDO_CAP + 5 {
+            state.set_undo(&format!("f{index}.txt"), undo_record());
+        }
+        assert_eq!(state.undo.len(), UNDO_CAP);
+        assert_eq!(state.undo_order.len(), UNDO_CAP);
+        assert!(!state.undo.contains_key("f0.txt"));
+        assert!(state.undo.contains_key(&format!("f{}.txt", UNDO_CAP + 4)));
+    }
+
+    /// 淘汰的判据是「最近一次编辑」，不是「第一次插入」——被反复编辑的文件不该被挤掉。
+    #[test]
+    fn editing_a_file_again_refreshes_its_undo_age() {
+        let mut state = temp_state("undo-lru");
+        state.set_undo("hot.txt", undo_record());
+        for index in 0..UNDO_CAP - 1 {
+            state.set_undo(&format!("f{index}.txt"), undo_record());
+        }
+        state.set_undo("hot.txt", undo_record());
+        for index in 0..UNDO_CAP - 1 {
+            state.set_undo(&format!("g{index}.txt"), undo_record());
+        }
+        assert!(state.undo.contains_key("hot.txt"));
+    }
+
+    #[test]
+    fn clearing_an_undo_record_also_drops_it_from_the_order() {
+        let mut state = temp_state("undo-clear");
+        state.set_undo("a.txt", undo_record());
+        state.clear_undo("a.txt");
+        assert!(state.undo.is_empty());
+        assert!(state.undo_order.is_empty());
     }
 }

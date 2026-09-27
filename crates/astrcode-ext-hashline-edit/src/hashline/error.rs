@@ -4,6 +4,8 @@
 //! 学会自我纠正的（「锚点过期 → 重新 hashline_read」），因此正文一律照抄原版，
 //! 只做语言层面的搬运，不改写措辞。
 
+use super::hash::Anchor;
+
 /// 原版的 `[E_*]` 错误标记。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
@@ -68,7 +70,7 @@ pub struct EditError {
     body: String,
     /// 已经展示给模型的锚点。出错时调用方把它们补记进 served 集合，模型下一轮
     /// 就能直接用这批新锚点重试，不必再读一次文件。
-    feedback_hashes: Vec<String>,
+    feedback_hashes: Vec<Anchor>,
 }
 
 impl EditError {
@@ -82,7 +84,7 @@ impl EditError {
 
     /// 附上「随错误一起展示的新锚点」。
     #[must_use]
-    pub fn with_feedback(mut self, hashes: Vec<String>) -> Self {
+    pub fn with_feedback(mut self, hashes: Vec<Anchor>) -> Self {
         self.feedback_hashes = hashes;
         self
     }
@@ -91,7 +93,7 @@ impl EditError {
         self.code
     }
 
-    pub fn feedback_hashes(&self) -> &[String] {
+    pub fn feedback_hashes(&self) -> &[Anchor] {
         &self.feedback_hashes
     }
 
@@ -146,8 +148,9 @@ mod tests {
 
     #[test]
     fn feedback_hashes_are_carried_but_not_rendered() {
-        let error = EditError::new(ErrorCode::StaleAnchor, "stale").with_feedback(vec!["aB3".into()]);
-        assert_eq!(error.feedback_hashes(), ["aB3"]);
+        let error =
+            EditError::new(ErrorCode::StaleAnchor, "stale").with_feedback(vec![Anchor::new("aB3")]);
+        assert_eq!(error.feedback_hashes(), [Anchor::new("aB3")]);
         assert_eq!(error.render(), "[E_STALE_ANCHOR] stale");
     }
 }

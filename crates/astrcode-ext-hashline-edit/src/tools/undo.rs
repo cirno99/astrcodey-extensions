@@ -117,7 +117,9 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hashline::hash::line_hashes_pure;
+    use std::sync::Arc;
+
+    use crate::hashline::hash::{Anchor, line_hashes_pure};
     use crate::state::UndoRecord;
 
     fn temp_state(name: &str) -> (std::path::PathBuf, SessionState) {
@@ -139,7 +141,7 @@ mod tests {
     }
 
     /// 造一个「刚被 replace 过」的文件与还原点。
-    fn after_replace(dir: &Path, state: &mut SessionState, path: &str) -> Vec<String> {
+    fn after_replace(dir: &Path, state: &mut SessionState, path: &str) -> Arc<Vec<Anchor>> {
         let before = "one\ntwo\n";
         let after = "one\nTWO\n";
         std::fs::write(dir.join(path), after).expect("写入失败");
@@ -150,11 +152,11 @@ mod tests {
                 content: before.to_owned(),
                 bom: String::new(),
                 ending: "\n".to_owned(),
-                hashes: hashes.clone(),
+                hashes: Arc::new(hashes.clone()),
                 result_content: after.to_owned(),
             },
         );
-        hashes
+        Arc::new(hashes)
     }
 
     #[test]
@@ -199,7 +201,7 @@ mod tests {
                 content: before.to_owned(),
                 bom: String::new(),
                 ending: "\n".to_owned(),
-                hashes,
+                hashes: Arc::new(hashes),
                 result_content: "one\nTWO\nEXTRA\n".to_owned(),
             },
         );
@@ -259,7 +261,7 @@ mod tests {
                 content: before.to_owned(),
                 bom: "\u{feff}".to_owned(),
                 ending: "\r\n".to_owned(),
-                hashes,
+                hashes: Arc::new(hashes),
                 result_content: "ONE\ntwo\n".to_owned(),
             },
         );

@@ -14,7 +14,7 @@ use super::{
         val_edit,
     },
     error::{EditError, ErrorCode},
-    hash::line_hashes_pure,
+    hash::{Anchor, line_hashes_pure},
     lines::changed_range,
     request::{EditRequest, strip_bare_prefixes, strip_diff_prefixes, swap_reversed_ranges},
 };
@@ -84,13 +84,13 @@ enum Span {
 pub fn apply_edit(
     content: &str,
     edit: &EditRequest,
-    precomputed_hashes: Option<&[String]>,
+    precomputed_hashes: Option<&[Anchor]>,
     file_path: Option<&str>,
-    served: Option<&BTreeSet<String>>,
+    served: Option<&BTreeSet<Anchor>>,
 ) -> Result<Applied, EditError> {
     let index = build_index(content);
     let computed_hashes;
-    let file_hashes: &[String] = match precomputed_hashes {
+    let file_hashes: &[Anchor] = match precomputed_hashes {
         Some(hashes) => hashes,
         None => {
             computed_hashes = line_hashes_pure(content)?;
@@ -200,7 +200,7 @@ pub fn apply_edit(
 fn anchor_feedback(
     mismatches: &[super::anchor::Mismatch],
     file_lines: &[&str],
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
     file_path: Option<&str>,
 ) -> Result<EditError, EditError> {
     let MismatchFeedback { code, body, hashes } =
@@ -293,19 +293,19 @@ mod tests {
 
     const SAMPLE: &str = "function hello() {\n  console.log(\"world\");\n}\n\n// end\n";
 
-    fn hashes(content: &str) -> Vec<String> {
+    fn hashes(content: &str) -> Vec<Anchor> {
         line_hashes_pure(content).expect("分配失败")
     }
 
-    fn edit(from: &str, to: &str, lines: &[&str]) -> EditRequest {
+    fn edit(from: impl AsRef<str>, to: impl AsRef<str>, lines: &[&str]) -> EditRequest {
         EditRequest {
             content_lines: lines.iter().map(|line| (*line).to_owned()).collect(),
             hash_bounds: [
                 HashRef {
-                    hash: from.to_owned(),
+                    hash: from.as_ref().to_owned(),
                 },
                 HashRef {
-                    hash: to.to_owned(),
+                    hash: to.as_ref().to_owned(),
                 },
             ],
         }
@@ -332,7 +332,7 @@ mod tests {
         let applied = apply_edit(SAMPLE, &request, Some(&anchors), None, None).expect("编辑失败");
         assert_eq!(applied.content, SAMPLE);
         let noop = applied.noop.expect("应当判定为 noop");
-        assert_eq!(noop.loc, anchors[1]);
+        assert_eq!(noop.loc, anchors[1].as_str());
         assert_eq!(noop.current_content, "  console.log(\"world\");");
     }
 
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_anchors() {
-        let fake = ["aB3".to_owned(), "aB3".to_owned(), "cD4".to_owned()];
+        let fake = [Anchor::new("aB3"), Anchor::new("aB3"), Anchor::new("cD4")];
         let request = edit("aB3", "aB3", &["x"]);
         let error = apply_edit("a\nb\nc\n", &request, Some(&fake), None, None)
             .expect_err("应当报歧义锚点");
@@ -431,9 +431,7 @@ mod tests {
     #[test]
     fn enforces_the_served_range_guard() {
         let anchors = hashes(SAMPLE);
-        let served: BTreeSet<String> = [anchors[0].clone(), anchors[3].clone()]
-            .into_iter()
-            .collect();
+        let served: BTreeSet<Anchor> = [anchors[0], anchors[3]].into_iter().collect();
         let request = edit(&anchors[1], &anchors[1], &["  console.log(\"hi\");"]);
         let error = apply_edit(SAMPLE, &request, Some(&anchors), Some("sample.js"), Some(&served))
             .expect_err("应当被 served 守卫拦下");

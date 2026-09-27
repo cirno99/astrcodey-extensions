@@ -5,7 +5,7 @@
 
 use super::{
     error::EditError,
-    hash::{HASH_LEN, HASH_SEP},
+    hash::{Anchor, HASH_LEN, HASH_SEP},
     lines::split_lines,
 };
 
@@ -18,7 +18,7 @@ pub fn fmt_diff_line(prefix: char, line: &str, hash: Option<&str>) -> String {
 }
 
 /// 把锚点数组与行数组渲染成 `HASH│content` 区块。
-pub fn fmt_region(hashes: &[String], lines: &[&str]) -> Result<String, EditError> {
+pub fn fmt_region(hashes: &[Anchor], lines: &[&str]) -> Result<String, EditError> {
     if hashes.len() != lines.len() {
         return Err(EditError::internal(format!(
             "fmtRegion: hashes.length ({}) must match lines.length ({}).",
@@ -75,8 +75,8 @@ pub fn gen_diff(
     old_content: &str,
     new_content: &str,
     context_lines: usize,
-    new_hashes: Option<&[String]>,
-    old_hashes: Option<&[String]>,
+    new_hashes: Option<&[Anchor]>,
+    old_hashes: Option<&[Anchor]>,
 ) -> (String, Option<usize>) {
     let old_lines = split_lines(old_content);
     let new_lines = split_lines(new_content);
@@ -130,10 +130,10 @@ pub fn gen_diff(
     (output.join("\n"), Some(first + 1))
 }
 
-fn hash_at(hashes: Option<&[String]>, index: usize) -> Option<&str> {
+fn hash_at(hashes: Option<&[Anchor]>, index: usize) -> Option<&str> {
     hashes
         .and_then(|hashes| hashes.get(index))
-        .map(String::as_str)
+        .map(Anchor::as_str)
 }
 
 #[cfg(test)]
@@ -145,10 +145,10 @@ mod tests {
     #[test]
     fn fmt_region_requires_aligned_arrays() {
         assert_eq!(
-            fmt_region(&["aB3".to_owned()], &["x"]).expect("渲染失败"),
+            fmt_region(&[Anchor::new("aB3")], &["x"]).expect("渲染失败"),
             format!("aB3{HASH_SEP}x")
         );
-        assert!(fmt_region(&["aB3".to_owned()], &["x", "y"]).is_err());
+        assert!(fmt_region(&[Anchor::new("aB3")], &["x", "y"]).is_err());
     }
 
     #[test]
@@ -162,7 +162,7 @@ mod tests {
         let old_content = "one\ntwo\nthree\n";
         let old_hashes = line_hashes_pure(old_content).expect("分配失败");
         let new_content = "one\nTWO\nthree\n";
-        let removed: FxHashSet<String> = [old_hashes[1].clone()].into_iter().collect();
+        let removed: FxHashSet<Anchor> = [old_hashes[1]].into_iter().collect();
         let new_hashes =
             map_stable_hashes(old_content, &old_hashes, new_content, &removed).expect("映射失败");
 

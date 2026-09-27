@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use super::{
     error::{EditError, ErrorCode},
-    hash::{HASH_LEN, HASH_SEP, is_hash},
+    hash::{Anchor, HASH_LEN, HASH_SEP, is_hash},
 };
 
 /// `replace` 的原始参数（尚未归一化）。
@@ -133,10 +133,10 @@ pub fn res_edit(raw: &RawEdit, warnings: &mut Vec<String>) -> Result<EditRequest
 /// 剥离 `replacement_text` 行首粘贴进来的 `HASH│` 前缀。
 pub fn strip_bare_prefixes(
     edit: &EditRequest,
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
     warnings: &mut Vec<String>,
 ) -> EditRequest {
-    let file_hash_set: FxHashSet<&str> = file_hashes.iter().map(String::as_str).collect();
+    let file_hash_set: FxHashSet<&str> = file_hashes.iter().map(Anchor::as_str).collect();
     let mut stripped: Vec<(usize, bool)> = Vec::new();
     let content_lines = edit
         .content_lines
@@ -232,7 +232,7 @@ pub fn strip_diff_prefixes(edit: &EditRequest, warnings: &mut Vec<String>) -> Ed
 /// 只在这两个锚点都能在当前文件里唯一定位时才动；否则留给锚点校验去报过期。
 pub fn swap_reversed_ranges(
     edit: &EditRequest,
-    file_hashes: &[String],
+    file_hashes: &[Anchor],
     warnings: &mut Vec<String>,
 ) -> EditRequest {
     let line_by_hash: FxHashMap<&str, usize> = file_hashes
@@ -385,7 +385,7 @@ mod tests {
             hash_bounds: [HashRef { hash: "aB3".into() }, HashRef { hash: "aB3".into() }],
         };
         let mut warnings = Vec::new();
-        let stripped = strip_bare_prefixes(&edit, &["aB3".to_owned()], &mut warnings);
+        let stripped = strip_bare_prefixes(&edit, &[Anchor::new("aB3")], &mut warnings);
         assert_eq!(stripped.content_lines, ["keep", "gone"]);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("1 of 2 stripped hash(es) match current file lines"));
@@ -399,7 +399,7 @@ mod tests {
             hash_bounds: [HashRef { hash: "aB3".into() }, HashRef { hash: "aB3".into() }],
         };
         let mut warnings = Vec::new();
-        let stripped = strip_bare_prefixes(&edit, &["aB3".to_owned()], &mut warnings);
+        let stripped = strip_bare_prefixes(&edit, &[Anchor::new("aB3")], &mut warnings);
         assert_eq!(stripped.content_lines, ["literal"]);
         assert!(warnings[0].contains("none of the stripped hashes match current file lines"));
         assert!(warnings[0].contains("literal content starting with 'HASH│'"));
@@ -436,7 +436,7 @@ mod tests {
             content_lines: vec!["x".into()],
             hash_bounds: [HashRef { hash: "cD4".into() }, HashRef { hash: "aB3".into() }],
         };
-        let file_hashes = ["aB3".to_owned(), "bC5".to_owned(), "cD4".to_owned()];
+        let file_hashes = [Anchor::new("aB3"), Anchor::new("bC5"), Anchor::new("cD4")];
         let mut warnings = Vec::new();
         let swapped = swap_reversed_ranges(&edit, &file_hashes, &mut warnings);
         assert_eq!(swapped.hash_bounds[0].hash, "aB3");
@@ -446,7 +446,7 @@ mod tests {
 
         // 锚点解析不出来时原样返回，交给过期检查报错
         let mut warnings = Vec::new();
-        let untouched = swap_reversed_ranges(&edit, &["zZ9".to_owned()], &mut warnings);
+        let untouched = swap_reversed_ranges(&edit, &[Anchor::new("zZ9")], &mut warnings);
         assert_eq!(untouched, edit);
         assert!(warnings.is_empty());
     }

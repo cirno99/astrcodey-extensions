@@ -9,7 +9,7 @@
 //!    最多丢掉一次撤销点，不会出现「文件已改但没有还原点」。
 //! 5. 稳定映射出新锚点、生成 diff、把 diff 里展示过的锚点记进 served。
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
@@ -20,7 +20,7 @@ use crate::{
         apply::apply_edit,
         diff::gen_diff,
         error::{EditError, ErrorCode},
-        hash::{HASH_SPACE, map_stable_hashes},
+        hash::{Anchor, HASH_SPACE, map_stable_hashes},
         lines::{clip_line, restore_endings, split_lines},
         request::{EditRequest, RawEdit, res_edit},
     },
@@ -120,7 +120,7 @@ pub fn execute(
             content: original.clone(),
             bom: file.bom.to_owned(),
             ending: file.ending.as_str().to_owned(),
-            hashes: original_hashes.clone(),
+            hashes: Arc::clone(&original_hashes),
             result_content: result.clone(),
         },
     );
@@ -146,8 +146,9 @@ pub fn execute(
         return Err(EditError::plain(format!("replace failed: {error}")));
     }
 
-    let result_hashes = map_stable_hashes(&original, &original_hashes, &result, &removed_hashes)?;
-    state.put_snapshot(&key, &result, result_hashes.clone());
+    let result_hashes =
+        Arc::new(map_stable_hashes(&original, &original_hashes, &result, &removed_hashes)?);
+    state.put_snapshot(&key, &result, Arc::clone(&result_hashes));
     let diff = gen_diff(
         &original,
         &result,
@@ -173,7 +174,7 @@ pub fn execute(
 }
 
 /// 被替换范围内的全部锚点。用于稳定映射时判断哪些锚点「腾出来了」。
-fn collect_removed_hashes(edit: &EditRequest, original_hashes: &[String]) -> FxHashSet<String> {
+fn collect_removed_hashes(edit: &EditRequest, original_hashes: &[Anchor]) -> FxHashSet<Anchor> {
     let mut removed = FxHashSet::default();
     let start = index_of(original_hashes, &edit.hash_bounds[0].hash);
     let end = index_of(original_hashes, &edit.hash_bounds[1].hash);
@@ -193,7 +194,7 @@ fn collect_removed_hashes(edit: &EditRequest, original_hashes: &[String]) -> FxH
 /// 增删行数统计。自动纠正删掉的行不计入新增。
 fn count_line_changes(
     edit: &EditRequest,
-    original_hashes: &[String],
+    original_hashes: &[Anchor],
     is_noop: bool,
     auto_fix_count: usize,
 ) -> (usize, usize) {
@@ -211,8 +212,8 @@ fn count_line_changes(
     (total_added, total_removed)
 }
 
-fn index_of(hashes: &[String], hash: &str) -> Option<usize> {
-    hashes.iter().position(|candidate| candidate == hash)
+fn index_of(hashes: &[Anchor], hash: &str) -> Option<usize> {
+    hashes.iter().position(|candidate| candidate.as_str() == hash)
 }
 
 fn render_warnings(warnings: &[String]) -> String {
@@ -250,23 +251,28 @@ mod tests {
     }
 
     /// 建立「模型已经读过这个文件」的前置状态。
-    fn serve(dir: &Path, state: &mut SessionState, path: &str, content: &str) -> Vec<String> {
+    fn serve(dir: &Path, state: &mut SessionState, path: &str, content: &str) -> Arc<Vec<Anchor>> {
         let target = dir.join(path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).expect("创建父目录失败");
         }
         std::fs::write(&target, content).expect("写入失败");
         let hashes = line_hashes_pure(content).expect("分配失败");
-        state.put_snapshot(path, content, hashes.clone());
+        state.put_snapshot(path, content, Arc::new(hashes.clone()));
         state.record_served(path, &hashes);
-        hashes
+        Arc::new(hashes)
     }
 
-    fn args(path: &str, from: &str, to: &str, text: serde_json::Value) -> ReplaceArgs {
+    fn args(
+        path: &str,
+        from: impl AsRef<str>,
+        to: impl AsRef<str>,
+        text: serde_json::Value,
+    ) -> ReplaceArgs {
         ReplaceArgs {
             path: path.to_owned(),
-            remove_from: from.to_owned(),
-            remove_to: to.to_owned(),
+            remove_from: from.as_ref().to_owned(),
+            remove_to: to.as_ref().to_owned(),
             replacement_text: text,
         }
     }
@@ -312,7 +318,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), &raw).expect("写入失败");
         let normalized = "one\ntwo\n";
         let hashes = line_hashes_pure(normalized).expect("分配失败");
-        state.put_snapshot("a.txt", normalized, hashes.clone());
+        state.put_snapshot("a.txt", normalized, Arc::new(hashes.clone()));
         state.record_served("a.txt", &hashes);
 
         execute(
@@ -335,7 +341,7 @@ mod tests {
         let content = "one\ntwo\nthree\n";
         std::fs::write(dir.join("a.txt"), content).expect("写入失败");
         let hashes = line_hashes_pure(content).expect("分配失败");
-        state.put_snapshot("a.txt", content, hashes.clone());
+        state.put_snapshot("a.txt", content, Arc::new(hashes.clone()));
         state.record_served("a.txt", &[hashes[0].clone()]);
 
         let error = execute(
@@ -465,7 +471,7 @@ mod tests {
         let record = state.undo_record("a.txt").expect("应当留下还原点");
         assert_eq!(record.content, content);
         assert_eq!(record.result_content, "ONE\ntwo\n");
-        assert_eq!(record.hashes, hashes);
+        assert_eq!(record.hashes.as_slice(), hashes.as_slice());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -558,8 +564,8 @@ mod tests {
         let edit = EditRequest {
             content_lines: vec!["x".into(), "y".into(), "z".into()],
             hash_bounds: [
-                crate::hashline::HashRef { hash: hashes[0].clone() },
-                crate::hashline::HashRef { hash: hashes[0].clone() },
+                crate::hashline::HashRef { hash: hashes[0].to_string() },
+                crate::hashline::HashRef { hash: hashes[0].to_string() },
             ],
         };
         assert_eq!(count_line_changes(&edit, &hashes, false, 0), (3, 1));
@@ -569,9 +575,9 @@ mod tests {
 
     #[test]
     fn collect_removed_hashes_covers_the_whole_range() {
-        let hashes: Vec<String> = ["aB3", "cD4", "eF5", "gH6"]
+        let hashes: Vec<Anchor> = ["aB3", "cD4", "eF5", "gH6"]
             .iter()
-            .map(|hash| (*hash).to_owned())
+            .map(|hash| Anchor::new(hash))
             .collect();
         let edit = EditRequest {
             content_lines: vec![],
@@ -582,7 +588,7 @@ mod tests {
         };
         let removed = collect_removed_hashes(&edit, &hashes);
         assert_eq!(removed.len(), 2);
-        assert!(removed.contains("cD4"));
-        assert!(removed.contains("eF5"));
+        assert!(removed.contains(&Anchor::new("cD4")));
+        assert!(removed.contains(&Anchor::new("eF5")));
     }
 }

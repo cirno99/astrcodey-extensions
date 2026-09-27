@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::{
     fsops,
     hashline::{
-        HASH_SEP,
+        Anchor, HASH_SEP,
         error::{EditError, ErrorCode},
         hash::HASH_SPACE,
         lines::split_lines,
@@ -76,7 +76,7 @@ pub fn execute(
     let hashes = state.hashes_for(&display_path, &file.normalized)?;
 
     if file.normalized.is_empty() {
-        let empty_hash = hashes.first().cloned().unwrap_or_default();
+        let empty_hash = hashes.first().copied().unwrap_or(Anchor::new("AuN"));
         state.record_served(&display_path, std::slice::from_ref(&empty_hash));
         return Ok(ToolOutcome::ok(format!(
             "<path>{display_path}</path>\n<type>file</type>\n<content>\n{empty_hash}{HASH_SEP}\n\
@@ -90,7 +90,7 @@ pub fn execute(
 
     let end_index = (offset - 1 + limit).min(total);
     let mut rows: Vec<String> = Vec::new();
-    let mut served: Vec<String> = Vec::new();
+    let mut served: Vec<Anchor> = Vec::new();
     let mut budget = RowBudget::default();
     let mut capped = false;
 

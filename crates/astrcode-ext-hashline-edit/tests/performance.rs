@@ -27,7 +27,7 @@ use astrcode_ext_hashline_edit::hashline::{
     anchor::val_edit,
     apply::apply_edit,
     diff::gen_diff,
-    hash::{line_hashes_pure, map_stable_hashes},
+    hash::{Anchor, line_hashes_pure, map_stable_hashes},
     lines::{canon, split_lines},
     request::EditRequest,
 };
@@ -73,17 +73,17 @@ fn hot_paths() {
 
     let content = sample_source(LINES);
     let hashes = line_hashes_pure(&content).expect("分配锚点失败");
-    let removed: FxHashSet<String> = [hashes[LINES / 2].clone()].into_iter().collect();
+    let removed: FxHashSet<Anchor> = [hashes[LINES / 2]].into_iter().collect();
     let edited = content.replacen("    // 中文注释", "    // 改过的注释", 1);
     let lines = split_lines(&content);
     let edit = EditRequest {
         content_lines: vec!["    // 改过的注释".to_owned()],
         hash_bounds: [
             HashRef {
-                hash: hashes[LINES / 2].clone(),
+                hash: hashes[LINES / 2].to_string(),
             },
             HashRef {
-                hash: hashes[LINES / 2].clone(),
+                hash: hashes[LINES / 2].to_string(),
             },
         ],
     };
