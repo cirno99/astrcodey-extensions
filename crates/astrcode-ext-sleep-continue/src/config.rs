@@ -32,9 +32,31 @@ pub const DEFAULT_MAX: u32 = 100;
 /// 默认空转熔断阈值：连续多少次续跑都没有产生工具调用就停下。0 表示关闭熔断。
 pub const DEFAULT_IDLE_STOP: u32 = 3;
 
+/// 默认复读熔断阈值：连续多少次续跑都「没有新内容」（没有工具调用，且回复与上一次重复或
+/// 为空）就停下。0 表示关闭。
+///
+/// 默认 1 比空转阈值严：复读是模型在输出里打转，多喂几轮几乎不会自己走出来，而每一轮都要
+/// 烧掉整段上下文。宁可早点停下让人看一眼。
+pub const DEFAULT_NO_PROGRESS_STOP: u32 = 1;
+
+/// 上一步没有新内容时改用的纠正提示。
+///
+/// **这段文本模型可见**（它会作为用户消息落进转录），改动必须同步 `AGENTS.md`。
+/// 措辞刻意把两种情形都点出来（没有工具调用 / 回复重复或为空）：模型看得到自己上一步
+/// 干了什么，把判据说清楚才有可能让它换一种动作，而不是再复述一遍计划。
+pub const DEFAULT_NUDGE_TEXT: &str = "上一步没有产生可继续的动作：没有工具调用，或回复与上一次重复、为空。请直接给出下一步具体动作或结论，不要复述计划。";
+
+/// 默认重试上限：单次人工 turn 因失败而自动重起的次数。0 表示关闭失败重试。
+pub const DEFAULT_RETRY_MAX: u32 = 3;
+
+/// 默认首次重试前的等待时长（毫秒）。
+pub const DEFAULT_RETRY_BASE_DELAY_MS: u32 = 1_000;
+
+/// 默认退避上限（毫秒）。
+pub const DEFAULT_RETRY_MAX_DELAY_MS: u32 = 5_000;
+
 /// 默认被自动应答的提问工具。宿主内建的提问工具叫 `askUser`。
 pub const DEFAULT_ANSWER_TOOLS: [&str; 1] = ["askUser"];
-
 /// 续跑文本的长度上限，按 UTF-8 字节计。
 ///
 /// 宿主侧的上限是 1 MiB（`MAX_PROMPT_TEXT_BYTES`），这里收紧到 8 KiB：续跑文本是一句
@@ -67,6 +89,16 @@ pub struct Config {
     pub max: u32,
     /// 空转熔断阈值，0 表示关闭。
     pub idle_stop: u32,
+    /// 复读熔断阈值，0 表示关闭。
+    pub no_progress_stop: u32,
+    /// 上一步没有新内容时改用的纠正提示。
+    pub nudge_text: String,
+    /// 失败重试上限（单次人工 turn），0 表示关闭失败重试。
+    pub retry_max: u32,
+    /// 首次重试前的等待时长（毫秒）。
+    pub retry_base_delay_ms: u32,
+    /// 退避上限（毫秒）。
+    pub retry_max_delay_ms: u32,
     /// 提问自动应答。
     pub answer: Answer,
 }
@@ -78,6 +110,11 @@ impl Default for Config {
             continue_text: DEFAULT_CONTINUE_TEXT.to_owned(),
             max: DEFAULT_MAX,
             idle_stop: DEFAULT_IDLE_STOP,
+            no_progress_stop: DEFAULT_NO_PROGRESS_STOP,
+            nudge_text: DEFAULT_NUDGE_TEXT.to_owned(),
+            retry_max: DEFAULT_RETRY_MAX,
+            retry_base_delay_ms: DEFAULT_RETRY_BASE_DELAY_MS,
+            retry_max_delay_ms: DEFAULT_RETRY_MAX_DELAY_MS,
             answer: Answer {
                 enabled: true,
                 tools: DEFAULT_ANSWER_TOOLS
@@ -109,6 +146,21 @@ impl Config {
                 .unwrap_or(defaults.max),
             // 熔断阈值 0 是合法配置：显式关闭熔断。
             idle_stop: u32_at(source, "idleStop").unwrap_or(defaults.idle_stop),
+            // 同上：0 表示关闭复读熔断。
+            no_progress_stop: u32_at(source, "noProgressStop").unwrap_or(defaults.no_progress_stop),
+            // 空串与缺省同义：喂给模型一句空话等于没纠正。
+            nudge_text: string_at(source, "nudgeText")
+                .filter(|text| !text.is_empty())
+                .unwrap_or(defaults.nudge_text),
+            // 重试上限 0 是合法配置：显式关闭失败重试。
+            retry_max: u32_at(source, "retryMax").unwrap_or(defaults.retry_max),
+            // 退避时长 0 会被当成「不等」，虽然合法但没有意义；用默认值兜住更实在。
+            retry_base_delay_ms: u32_at(source, "retryBaseDelayMs")
+                .filter(|delay| *delay > 0)
+                .unwrap_or(defaults.retry_base_delay_ms),
+            retry_max_delay_ms: u32_at(source, "retryMaxDelayMs")
+                .filter(|delay| *delay > 0)
+                .unwrap_or(defaults.retry_max_delay_ms),
             answer: Answer {
                 enabled: bool_at(answer, "enabled", defaults.answer.enabled),
                 // 列表只保留字符串项；键缺失才回落默认值，显式空数组是合法配置
@@ -163,7 +215,9 @@ fn u32_at(source: Option<&Map<String, Value>>, key: &str) -> Option<u32> {
 }
 
 fn string_at(source: Option<&Map<String, Value>>, key: &str) -> Option<String> {
-    field(source, key).and_then(Value::as_str).map(str::to_owned)
+    field(source, key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 /// 默认位置：`<astrcode_dir>/extension_data/<extension_id>/config.json`。
@@ -212,6 +266,11 @@ mod tests {
         assert_eq!(config.continue_text, DEFAULT_CONTINUE_TEXT);
         assert_eq!(config.max, DEFAULT_MAX);
         assert_eq!(config.idle_stop, DEFAULT_IDLE_STOP);
+        assert_eq!(config.no_progress_stop, DEFAULT_NO_PROGRESS_STOP);
+        assert_eq!(config.nudge_text, DEFAULT_NUDGE_TEXT);
+        assert_eq!(config.retry_max, DEFAULT_RETRY_MAX);
+        assert_eq!(config.retry_base_delay_ms, DEFAULT_RETRY_BASE_DELAY_MS);
+        assert_eq!(config.retry_max_delay_ms, DEFAULT_RETRY_MAX_DELAY_MS);
         assert!(config.answer.enabled);
         assert_eq!(config.answer.tools, vec!["askUser"]);
     }
@@ -223,12 +282,22 @@ mod tests {
             "continueText": "继续按计划推进",
             "max": 200,
             "idleStop": 5,
+            "noProgressStop": 2,
+            "nudgeText": "请直接给出下一步动作",
+            "retryMax": 1,
+            "retryBaseDelayMs": 250,
+            "retryMaxDelayMs": 800,
             "answer": { "enabled": false, "tools": ["askUser", "questionnaire"] }
         }));
         assert!(config.enabled);
         assert_eq!(config.continue_text, "继续按计划推进");
         assert_eq!(config.max, 200);
         assert_eq!(config.idle_stop, 5);
+        assert_eq!(config.no_progress_stop, 2);
+        assert_eq!(config.nudge_text, "请直接给出下一步动作");
+        assert_eq!(config.retry_max, 1);
+        assert_eq!(config.retry_base_delay_ms, 250);
+        assert_eq!(config.retry_max_delay_ms, 800);
         assert!(!config.answer.enabled);
         assert_eq!(config.answer.tools, vec!["askUser", "questionnaire"]);
     }
@@ -240,6 +309,11 @@ mod tests {
             "continueText": 7,
             "max": "many",
             "idleStop": [],
+            "noProgressStop": {},
+            "nudgeText": 7,
+            "retryMax": "many",
+            "retryBaseDelayMs": [],
+            "retryMaxDelayMs": null,
             "answer": "on"
         }));
         assert_eq!(config, Config::default());
@@ -251,6 +325,41 @@ mod tests {
         let config = Config::normalize(&json!({ "enabled": true, "myOwnNote": 42 }));
         assert!(config.enabled);
         assert_eq!(config.continue_text, DEFAULT_CONTINUE_TEXT);
+    }
+
+    /// 复读熔断阈值 0 同样是合法配置：显式关闭。
+    #[test]
+    fn a_zero_no_progress_stop_disables_the_breaker() {
+        assert_eq!(
+            Config::normalize(&json!({ "noProgressStop": 0 })).no_progress_stop,
+            0
+        );
+    }
+
+    /// 重试上限 0 是「关掉失败重试」。
+    #[test]
+    fn a_zero_retry_max_disables_retries() {
+        assert_eq!(Config::normalize(&json!({ "retryMax": 0 })).retry_max, 0);
+    }
+
+    /// 纠正提示是喂给模型的正文，空串等于没纠正，回落默认。
+    #[test]
+    fn an_empty_nudge_text_falls_back_to_the_default() {
+        assert_eq!(
+            Config::normalize(&json!({ "nudgeText": "" })).nudge_text,
+            DEFAULT_NUDGE_TEXT
+        );
+    }
+
+    /// 退避时长 0 会被当成「不等」，没有意义，回落默认。
+    #[test]
+    fn zero_backoff_delays_fall_back_to_the_defaults() {
+        let config = Config::normalize(&json!({
+            "retryBaseDelayMs": 0,
+            "retryMaxDelayMs": 0
+        }));
+        assert_eq!(config.retry_base_delay_ms, DEFAULT_RETRY_BASE_DELAY_MS);
+        assert_eq!(config.retry_max_delay_ms, DEFAULT_RETRY_MAX_DELAY_MS);
     }
 
     /// 空串会让宿主的 `non_empty_session_content` 拒绝注入，因此归一化阶段换成默认文本。

@@ -42,6 +42,16 @@ pub struct SessionRuntime {
     pub idle_streak: u32,
     /// 最近一次停止续跑的原因；续跑重新开始时清除。
     pub stop_reason: Option<StopReason>,
+    /// 连续多少次续跑都「没有新内容」（没有工具调用，且回复与上一次重复或为空）。
+    pub no_progress_streak: u32,
+    /// 本次人工 turn 内已成功投递的失败重试次数。
+    pub retries: u32,
+    /// 上一步回复的内容指纹，用于判定「与上一次重复」。
+    pub last_assistant: Option<u64>,
+    /// 持久事件日志的读取游标。只判新事件——历史错误不该触发重试。
+    pub event_cursor: Option<String>,
+    /// 最近一次被识别的失败摘要，供 `/sleep status` 展示。
+    pub last_failure: Option<String>,
 }
 
 /// [`SessionRuntime`] 的只读快照，供判定与展示使用。
@@ -50,6 +60,8 @@ pub struct Progress {
     pub continuations: u32,
     pub tool_calls: u32,
     pub idle_streak: u32,
+    pub no_progress_streak: u32,
+    pub retries: u32,
     pub stop_reason: Option<StopReason>,
 }
 
@@ -60,8 +72,24 @@ impl SessionRuntime {
             continuations: self.continuations,
             tool_calls: self.tool_calls,
             idle_streak: self.idle_streak,
+            no_progress_streak: self.no_progress_streak,
+            retries: self.retries,
             stop_reason: self.stop_reason.clone(),
         }
+    }
+
+    /// 人工接手：预算、空转链、复读链一起归零。
+    ///
+    /// 游标与「最近一次失败」是**观测**状态，跨人工输入保留：它们记的是宿主日志读到哪儿、
+    /// 上次坏成什么样，和预算无关，清掉只会让下一次 turn_end 白白丢一次判定。
+    fn reset_for_prompt(&mut self) {
+        self.continuations = 0;
+        self.tool_calls = 0;
+        self.idle_streak = 0;
+        self.no_progress_streak = 0;
+        self.retries = 0;
+        self.last_assistant = None;
+        self.stop_reason = None;
     }
 }
 
@@ -109,6 +137,10 @@ pub struct Stats {
     pub answers: AtomicU64,
     /// 因空转熔断而停止的次数。
     pub idle_stops: AtomicU64,
+    /// 因复读熔断而停止的次数。
+    pub no_progress_stops: AtomicU64,
+    /// 失败后自动重试并成功投递的次数。
+    pub retries: AtomicU64,
 }
 
 impl Stats {
@@ -118,6 +150,8 @@ impl Stats {
             continuations: read(&self.continuations),
             answers: read(&self.answers),
             idle_stops: read(&self.idle_stops),
+            no_progress_stops: read(&self.no_progress_stops),
+            retries: read(&self.retries),
         }
     }
 }
@@ -128,6 +162,8 @@ pub struct StatsSnapshot {
     pub continuations: u64,
     pub answers: u64,
     pub idle_stops: u64,
+    pub no_progress_stops: u64,
+    pub retries: u64,
 }
 
 /// 钩子与命令共享的状态。
@@ -245,12 +281,15 @@ impl SharedState {
         self.stats.continuations.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 结算本步活动进空转链，并返回结算后的快照。
+    /// 结算本步活动进空转链与复读链，并返回结算后的快照。
     ///
-    /// 「本步有没有产生工具调用」是空转判定的**唯一**输入，结算收敛在这一处，判定方
-    /// （[`crate::plan::decide`]）就不必再关心它。工具调用计数同时归零——它的语义是
-    /// 「自上次结算以来的活动」。
-    pub fn settle_step(&self, session_id: &str) -> Progress {
+    /// 「本步有没有产生工具调用」是空转判定的**唯一**输入，「回复有没有新内容」是复读判定
+    /// 的唯一输入；两者都在这里结算，判定方（[`crate::plan::decide`]）就不必再关心它们。
+    /// 工具调用计数同时归零——它的语义是「自上次结算以来的活动」。
+    ///
+    /// `assistant_text` 是刚结束那一步的可见回复。失败重试不走这里：那时没有「一步跑完」，
+    /// 上一步的指纹保持不动。
+    pub fn settle_step(&self, session_id: &str, assistant_text: &str) -> Progress {
         let Ok(mut sessions) = self.sessions.lock() else {
             return Progress::default();
         };
@@ -260,6 +299,12 @@ impl SharedState {
         } else {
             0
         };
+        if crate::plan::is_no_progress(runtime.last_assistant, assistant_text, runtime.tool_calls) {
+            runtime.no_progress_streak = runtime.no_progress_streak.saturating_add(1);
+        } else {
+            runtime.no_progress_streak = 0;
+        }
+        runtime.last_assistant = Some(crate::plan::text_fingerprint(assistant_text));
         runtime.tool_calls = 0;
         runtime.snapshot()
     }
@@ -269,13 +314,57 @@ impl SharedState {
     /// 上限的语义是「单次人工 turn 的预算」，所以人插过一次话就重新开始计数——这正是
     /// 「到顶只停止续跑、开关保持开启」能自洽的原因。
     pub fn reset_budget(&self, session_id: &str) {
-        self.update(session_id, |runtime| *runtime = SessionRuntime::default());
+        self.update(session_id, SessionRuntime::reset_for_prompt);
+    }
+
+    /// 记一次失败重试的投递。
+    pub fn note_retry(&self, session_id: &str) {
+        self.update(session_id, |runtime| {
+            runtime.retries = runtime.retries.saturating_add(1);
+        });
+        self.stats.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 记下最近一次被识别的失败摘要。
+    pub fn note_failure(&self, session_id: &str, summary: &str) {
+        self.update(session_id, |runtime| {
+            runtime.last_failure = Some(summary.to_owned());
+        });
+    }
+
+    /// 最近一次被识别的失败摘要，供 `/sleep status` 展示。
+    pub fn last_failure(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().ok()?;
+        sessions.get(session_id)?.last_failure.clone()
+    }
+
+    /// 读持久事件日志的游标。`None` 表示还没建立过——首次读只能从头扫，见 [`crate::hook`]。
+    pub fn event_cursor(&self, session_id: &str) -> Option<String> {
+        let Ok(sessions) = self.sessions.lock() else {
+            return None;
+        };
+        sessions
+            .get(session_id)
+            .and_then(|runtime| runtime.event_cursor.clone())
+    }
+
+    /// 推进持久事件日志的游标。
+    pub fn set_event_cursor(&self, session_id: &str, cursor: Option<String>) {
+        self.update(session_id, |runtime| {
+            runtime.event_cursor = cursor;
+        });
     }
 
     /// 记下停止续跑的原因；续跑重新开始时由 [`Self::note_continuation`] 清除。
     pub fn record_stop(&self, session_id: &str, reason: StopReason) {
-        if matches!(reason, StopReason::Idle { .. }) {
-            self.stats.idle_stops.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            StopReason::Idle { .. } => {
+                self.stats.idle_stops.fetch_add(1, Ordering::Relaxed);
+            }
+            StopReason::NoProgress { .. } => {
+                self.stats.no_progress_stops.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
         self.update(session_id, |runtime| {
             runtime.stop_reason = Some(reason);
@@ -458,11 +547,7 @@ mod tests {
 
     #[test]
     fn switch_round_trips_through_its_wire_names() {
-        for switch in [
-            SessionSwitch::Unset,
-            SessionSwitch::On,
-            SessionSwitch::Off,
-        ] {
+        for switch in [SessionSwitch::Unset, SessionSwitch::On, SessionSwitch::Off] {
             assert_eq!(SessionSwitch::parse(Some(switch.as_str())), switch);
         }
         assert_eq!(SessionSwitch::parse(None), SessionSwitch::Unset);
@@ -520,12 +605,12 @@ mod tests {
         let (state, dir) = state("settle");
 
         // 空跑两次：没有任何工具调用。
-        assert_eq!(state.settle_step("s-1").idle_streak, 1);
-        assert_eq!(state.settle_step("s-1").idle_streak, 2);
+        assert_eq!(state.settle_step("s-1", "第一次").idle_streak, 1);
+        assert_eq!(state.settle_step("s-1", "第二次").idle_streak, 2);
 
         // 干了一次活：链条断开。
         state.note_tool_call("s-1");
-        assert_eq!(state.settle_step("s-1").idle_streak, 0);
+        assert_eq!(state.settle_step("s-1", "第三次").idle_streak, 0);
 
         // 结算把工具调用计数清零，同一次活动不会被重复计入。
         assert_eq!(state.progress("s-1").tool_calls, 0);
@@ -536,7 +621,7 @@ mod tests {
     fn resetting_the_budget_clears_everything() {
         let (state, dir) = state("reset");
         state.note_continuation("s-1");
-        state.settle_step("s-1");
+        state.settle_step("s-1", "一步");
         state.record_stop("s-1", StopReason::CapReached { count: 1, max: 1 });
 
         state.reset_budget("s-1");

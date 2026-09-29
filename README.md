@@ -14,7 +14,7 @@ crates/
   astrcode-ext-hashline-edit/   hashline_read/replace/undo —— 哈希锚点编辑（每行一个地址）
   astrcode-ext-rtk-optimizer/   tool_input_transform + post_tool_use —— 命令改写与输出压缩
   astrcode-ext-weneed/          prompt_build + provider_contribution + pre_tool_use —— DeepSeek 的 we need 规范
-  astrcode-ext-sleep-continue/  continue_after_stop + pre_tool_use + post_tool_use —— 无人值守续跑
+  astrcode-ext-sleep-continue/  continue_after_stop + pre_tool_use + post_tool_use + turn_end —— 无人值守续跑与失败重试
 scripts/install.sh              构建并安装到 ~/.astrcode/extensions/
 ```
 
@@ -670,6 +670,7 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 /sleep on                  # 开启本会话的续跑（预算归零）
 /sleep off                 # 关闭本会话（全局配置不受影响）
 /sleep set 继续按计划推进   # 换续跑文本并开启
+/sleep nudge 请直接给出下一步动作  # 换「上一步没进展」时的纠正提示
 /sleep max 200             # 单次人工 turn 的续跑上限
 /sleep idle 3              # 空转熔断阈值，0 表示关闭
 /sleep answer off          # 关掉提问自动应答
@@ -678,17 +679,18 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 /sleep reset               # 恢复默认配置并清除本会话开关
 ```
 
-开启后，模型每次**自然停下**（没有 tool call）时注入一条「继续」再推一个 step。默认续跑
-文本是 `继续`，单次 turn 上限 100 次。
+开启后，模型每次**自然停下**时注入一条续跑消息再推一个 step：上一步干过活（有工具调用）
+就注入续跑文本（默认 `继续`），没干活就换成纠正提示。单次 turn 上限 100 次。
 
-### 四个钩子
+### 五个钩子
 
 | 钩子 | 模式 | 职责 |
 |---|---|---|
-| `continue_after_stop` | blocking | 判定该不该续跑；注入「继续」并返回 `ContinueOneStep` |
+| `continue_after_stop` | blocking | 判定该不该续跑；注入续跑文本并返回 `ContinueOneStep` |
 | `pre_tool_use` | blocking | 拦下提问类工具，按推荐项自动作答 |
-| `post_tool_use` | non-blocking | 记工具活动，供空转熔断判定 |
+| `post_tool_use` | non-blocking | 记工具活动，供空转熔断与复读熔断判定 |
 | `UserPromptSubmit` / `SessionStart` | non-blocking | 重置续跑预算 / 重载配置 |
+| `turn_end` | non-blocking | turn 失败后自动重试（读持久事件日志找错误） |
 
 ### 注入走 `defer_context`，不是 `provider_contribution`
 
@@ -724,12 +726,21 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 插件自己注入的消息在 turn 内被吸收，**不会**派发 `UserPromptSubmit`，因此这个归零只会被
 真正的人工输入触发。
 
-### 空转熔断
+### 两道熔断
 
-看门狗在内核层面做不了（见下），替代物是空转熔断：连续 `idleStop`（默认 3）次续跑都没有
-产生**任何工具调用**就停下，并把原因留在 `/sleep status` 里。
+看门狗在内核层面做不了（见下），替代物是两道熔断，命中就把原因留在 `/sleep status` 里：
 
-判据只看工具调用，不看文本：模型反复复述同一段总结同样是空转，而它每次都会输出非空文本。
+1. **空转熔断**：连续 `idleStop`（默认 3）次续跑都没有产生**任何工具调用**就停下。
+2. **复读熔断**：连续 `noProgressStop`（默认 1）次续跑都**没有新内容**——没有工具调用，
+   且回复与上一次规范化后完全相同或为空——就停下。
+
+复读阈值比空转严得多，因为复读是模型在输出里打转（`Let me output.` / `OK.` 交替），多喂几轮
+几乎不会自己走出来，而每一轮都要烧掉整段上下文。判定顺序是复读 → 空转 → 到顶：越具体的原因
+越值得人看。
+
+两道熔断都只在**判定停下**时生效，续跑时喂什么由「上一步有没有干活」决定：没干活（没有工具
+调用，或回复重复/为空）就换成纠正提示而不是裸的「继续」——对复读的模型再说一次「继续」等于
+给它同一张牌。
 
 ### 提问自动应答
 
@@ -745,17 +756,35 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 拦截原因里带一个逃生口：「如确需人类决策，请在回复末尾注明『需要人工确认：…』然后停下，
 不要死循环追问」。
 
-### 刻意不移植的两件事
+### 刻意不移植的一件事
 
-1. **看门狗（无活动 → abort）。** 插件的宿主调用走 task-local 的
-   `with_host_api` 作用域，而**这个作用域不传播到 `tokio::spawn`**
-   （见 worker 的 `with_host_api` 文档）：插件起不了任何「能在钩子之外调宿主」的定时器，
-   也就没人在超时那一刻去 abort。空转熔断补上了其中真正要紧的一半——模型不干活时停下。
-2. **错误退避重试。** 上游靠 `after_provider_response` 的 HTTP 429/5xx 触发，而
-   `ProviderHookInput` **没有 status 字段**；更要紧的是 provider 请求失败时 turn 直接报错，
-   `continue_after_stop` 根本不会被调用，那个时点上插件没有任何介入机会。工具级的
-   `is_error` 也不适合做判据：AstrCode 里 `shell` 的非零退出码就是 `is_error`，按
-   「失败/error」模式匹配会在正常干活时大量误伤，给每一轮都加上退避延迟。
+**看门狗（无活动 → abort）。** 插件的宿主调用走 task-local 的 `with_host_api` 作用域，而
+**这个作用域不传播到 `tokio::spawn`**（见 worker 的 `with_host_api` 文档）：插件起不了任何
+「能在钩子之外调宿主」的定时器，也就没人在超时那一刻去 abort。空转熔断与复读熔断补上了其中
+真正要紧的一半——模型不干活时停下。
+
+### turn 失败后的自动重试
+
+上游的退避重试靠 `after_provider_response` 的 HTTP 429/5xx 触发，这条路在 AstrCode 里走不通：
+`ProviderHookInput` 没有 status 字段，更要紧的是 provider 请求失败时 turn 直接报错，
+`continue_after_stop` **根本不会被调用**——那个时点上插件没有任何介入机会。
+
+能介入的时点是 `turn_end`。它的载荷里没有错误信息，所以插件自己去读持久事件日志
+（`session.read_events`，需要 `SessionHistory` 能力）：游标增量读，找新的 `error_occurred`。
+两点刻意设计：
+
+- **只认新事件。** 游标单调推进，历史错误不重试——扩展重载后从旧日志里翻出一条早就处理过的
+  错误，去重试一个其实已经成功的 turn，比漏掉一次重试更糟。首次没有游标时唯一的例外是
+  「错误就是日志的最后一条事件」：那说明这一轮失败之后什么都没写下来，正是「刚挂掉」的形状。
+- **投递用 `queue_or_start`，不是 `inject_or_start`。** `turn_end` 是在 turn 任务内部 await 的，
+  此刻 turn 还没结算完、执行槽仍被占用；`inject_or_start` 会把消息注进**正在失败**的那个 turn
+  而丢失，`queue_or_start` 则在「已完成未 settle」的窗口里先 settle 再启动队首。
+
+分类只能读文本（`ErrorOccurred.recoverable` 实测恒为 `false`，状态码也没有结构化字段）：
+`model not found`、401/403/404/400/413/422（按**词边界**匹配，免得把 `bytes-read=1329670`
+这类字节数当成状态码）、鉴权失败、配额不足等判为致命，直接停下等人；其余（传输中断、限流、
+上游 5xx、以及**认不出来的一切**）按有界退避重试，`retryMax` 默认 3 次，退避 1s → 2s → 4s
+截到 5s。`retryMax: 0` 关掉重试。
 
 ### 平台边界
 

@@ -120,26 +120,41 @@ RTK note: read compaction with source filtering is active, so `read` output may 
 
 ### `astrcode-ext-sleep-continue`
 
-这个插件**没有** `prompt_build` 贡献，不往 system prompt 里塞任何东西。但它有两处**模型可见**的
-文本，都由配置动态生成，因此按上面 `weneed` 守卫的惯例只记出处、不逐字抄录：
+这个插件**没有** `prompt_build` 贡献，不往 system prompt 里塞任何东西。但它有三处**模型可见**的
+文本，都由配置动态生成，因此按上面 `weneed` 守卫的惯例只记出处（默认值逐字抄录）：
 
 - **续跑文本**：`continue_after_stop` 时经 `session.control.defer_context` 注入的那条用户消息，
   默认 `继续`。它**会落进 transcript**——上下文里看到一条没有对应人类操作的用户消息
   「继续」，就是它。措辞由 `crates/astrcode-ext-sleep-continue/src/config.rs` 的
   `DEFAULT_CONTINUE_TEXT` 与 `/sleep set` 决定。
+- **纠正提示**：上一步没有工具调用（或回复与上一次重复、为空）时，续跑注入的不是续跑文本，
+  而是这条，默认：
+
+  ```
+  上一步没有产生可继续的动作：没有工具调用，或回复与上一次重复、为空。请直接给出下一步具体动作或结论，不要复述计划。
+  ```
+
+  措辞由同文件的 `DEFAULT_NUDGE_TEXT` 与 `/sleep nudge` 决定。**改动必须两处同步。**
 - **提问拦截原因**：`pre_tool_use` 拦下 `askUser` 时返回的 `Block { reason }`，措辞在
   `crates/astrcode-ext-sleep-continue/src/plan.rs` 的 `block_reason`。内容包含「每题自动选了
   哪个推荐项」以及一条逃生口（「如确需人类决策，请在回复末尾注明『需要人工确认：…』然后
   停下，不要死循环追问」）。
 
-另外三个钩子对模型是**静默**的：
+另外四个钩子对模型是**静默**的：
 
-- `post_tool_use`：只计数工具活动（空转熔断的判据），返回值恒为 `Allow`。
+- `post_tool_use`：只计数工具活动（空转熔断与复读熔断的判据），返回值恒为 `Allow`。
 - `UserPromptSubmit`：重置续跑预算。
 - `SessionStart`：重载配置。
+- `turn_end`：turn 失败后自动重试。`turn_end` 的载荷里**没有**错误信息，所以它用
+  `session.read_events`（`SessionHistory` 能力）增量读持久事件日志找 `error_occurred`，
+  按文本分类：传输中断 / 限流 / 上游 5xx 等按有界退避重试（`retryMax`，默认 3 次，
+  退避 1s→2s→4s 截到 5s），`model not found` / 401 / 403 / 404 / 400 等致命错误直接停下。
+  重试消息经 `session.control.queue_or_start` 排队——`turn_end` 在 turn 任务内部派发，
+  `inject_or_start` 会注进**正在失败**的那个 turn 而丢失。
 
-**在本仓库工作的含义**：上下文里出现「继续」这类没有来源的用户消息、或提问工具被拒的报错，
-都不是新要求，而是这个插件在无人值守模式下替人推流程——按原任务继续即可，不要在回复里
-提及它。反过来，如果你确实需要人类拍板，就在回复末尾写「需要人工确认：…」然后停下，那是
-插件认的退出信号；被拦下后反复调用提问工具只会被反复拒绝。续跑只在 `/sleep on` 过的会话
-生效。
+**在本仓库工作的含义**：上下文里出现「继续」或纠正提示这类没有来源的用户消息、或提问工具被
+拒的报错，都不是新要求，而是这个插件在无人值守模式下替人推流程——按原任务继续即可，不要在回
+复里提及它。反过来，如果你确实需要人类拍板，就在回复末尾写「需要人工确认：…」然后停下，那是
+插件认的退出信号；被拦下后反复调用提问工具只会被反复拒绝。续跑与失败重试只在 `/sleep on` 过
+的会话生效；看到自己上一步没调用工具就被喂了一句「上一步没有产生可继续的动作」，说明插件判
+定你在打转，此时应当直接执行动作或给结论，不要再复述计划。

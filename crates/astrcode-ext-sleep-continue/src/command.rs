@@ -19,14 +19,21 @@ use crate::{
 };
 
 /// `/sleep` 的子命令及其说明。
-const SUBCOMMANDS: [(&str, &str); 10] = [
+const SUBCOMMANDS: [(&str, &str); 11] = [
     ("on", "开启本会话的无人值守续跑（预算归零）"),
     ("off", "关闭本会话的续跑（全局配置不受影响）"),
     ("set", "设置续跑文本并开启：/sleep set 继续按计划推进"),
+    (
+        "nudge",
+        "设置上一步没有新内容时的纠正提示：/sleep nudge 请直接给出下一步动作",
+    ),
     ("max", "单次人工 turn 的续跑上限：/sleep max 100"),
     ("idle", "空转熔断阈值，0 表示关闭：/sleep idle 3"),
     ("answer", "提问是否自动应答：/sleep answer on|off"),
-    ("tools", "自动应答的工具名单：/sleep tools [add|remove] askUser"),
+    (
+        "tools",
+        "自动应答的工具名单：/sleep tools [add|remove] askUser",
+    ),
     ("status", "查看开关、预算、统计与最近一次停止原因"),
     ("reset", "恢复默认配置并清除本会话开关"),
     ("help", "显示本说明"),
@@ -56,7 +63,9 @@ pub async fn run() -> Result<(), ErrorPayload> {
     worker.capability(ExtensionCapability::TurnContinuationControl);
     worker.capability(ExtensionCapability::SessionControl);
     worker.capability(ExtensionCapability::ToolIntercept);
-
+    // `session.read_events` 需要 `session_history`：turn 失败时靠它读持久事件日志，找出
+    // `error_occurred` 的文本。`turn_end` 载荷里没有错误信息，这是唯一的来源。
+    worker.capability(ExtensionCapability::SessionHistory);
     let store = config::store();
     if let EnsureOutcome::Failed(error) = store.ensure_exists::<Config>() {
         eprintln!("{EXTENSION_ID}: {error}");
@@ -125,6 +134,23 @@ pub async fn run() -> Result<(), ErrorPayload> {
         }),
     )?;
 
+    // turn 失败后自动重试。`turn_end` 在 turn 任务内部派发，此刻 turn 还没结算完，所以重试
+    // 消息只能排队（`queue_or_start`）——原因见 `hook::recover_failed_turn`。
+    let turn_end_state = Arc::clone(&state);
+    worker.hook(
+        LifecycleEvent::TurnEnd,
+        HookMode::NonBlocking,
+        Arc::new(move |event, _ctx| {
+            let state = Arc::clone(&turn_end_state);
+            Box::pin(async move {
+                if let Some(session_id) = hook::session_id_of(&event) {
+                    hook::recover_failed_turn(&state, session_id).await;
+                }
+                Ok(HandlerResult::ok())
+            })
+        }),
+    )?;
+
     let command_state = Arc::clone(&state);
     worker.command(
         command(COMMAND_NAME)
@@ -150,7 +176,7 @@ async fn dispatch(
     match ctx.invocation() {
         WorkerCommandInvocation::Complete { cursor } => {
             Ok(completions(argument_prefix(ctx.argument(), cursor)))
-        },
+        }
         WorkerCommandInvocation::Execute => execute(state, ctx).await,
     }
 }
@@ -166,6 +192,7 @@ async fn execute(
         "" | "on" => Ok(enable(state, ctx, &tail).await),
         "off" => Ok(deactivate(state, ctx).await),
         "set" => Ok(set_text(state, ctx, &tail).await),
+        "nudge" => Ok(set_nudge(state, ctx, &tail).await),
         "max" => Ok(set_max(state, ctx, &tail).await),
         "idle" => Ok(set_idle(state, ctx, &tail).await),
         "answer" => Ok(set_answer(state, ctx, &tail).await),
@@ -181,11 +208,7 @@ async fn execute(
 }
 
 /// `/sleep on [续跑文本]`：开启本会话，可选地同时换掉续跑文本。
-async fn enable(
-    state: &Arc<SharedState>,
-    ctx: &WorkerCommandContext,
-    text: &str,
-) -> HandlerResult {
+async fn enable(state: &Arc<SharedState>, ctx: &WorkerCommandContext, text: &str) -> HandlerResult {
     if !text.is_empty()
         && let Err(message) = apply_continue_text(state, text)
     {
@@ -235,7 +258,10 @@ async fn deactivate(state: &Arc<SharedState>, ctx: &WorkerCommandContext) -> Han
     if let Err(message) = write_switch(state, ctx.session_id(), SessionSwitch::Off).await {
         return display(&format!("{PREFIX}会话开关写入失败：{message}"), true);
     }
-    let content = format!("{PREFIX}已关闭本会话的续跑。\n{}", effective(state, ctx).await);
+    let content = format!(
+        "{PREFIX}已关闭本会话的续跑。\n{}",
+        effective(state, ctx).await
+    );
     refresh(state, ctx, &content, false).await
 }
 
@@ -265,6 +291,41 @@ async fn set_text(
     enable_with(state, ctx, &content).await
 }
 
+/// `/sleep nudge <文本>`：换掉「上一步没有新内容」时的纠正提示。
+///
+/// 与 `set` 的区别是**不开启会话**：改的是续跑时喂什么，不是要不要续跑。
+async fn set_nudge(
+    state: &Arc<SharedState>,
+    ctx: &WorkerCommandContext,
+    text: &str,
+) -> HandlerResult {
+    if text.is_empty() {
+        return display(
+            &format!(
+                "{PREFIX}`nudge` 缺少文本。用法：`/sleep nudge 请直接给出下一步动作`。\
+                 文本上限 {MAX_CONTINUE_TEXT_BYTES} 字节。"
+            ),
+            true,
+        );
+    }
+    if text.len() > MAX_CONTINUE_TEXT_BYTES {
+        return display(
+            &format!(
+                "{PREFIX}纠正提示过长（{} 字节，上限 {MAX_CONTINUE_TEXT_BYTES}）。",
+                text.len()
+            ),
+            true,
+        );
+    }
+    let mut config = state.config();
+    config.nudge_text = text.to_owned();
+    if let Err(error) = state.set_config(config) {
+        return display(&format!("{PREFIX}配置保存失败：{error}"), true);
+    }
+    let content = format!("{PREFIX}纠正提示已改为「{text}」。");
+    refresh(state, ctx, &content, false).await
+}
+
 /// 校验并落盘续跑文本。
 fn apply_continue_text(state: &Arc<SharedState>, text: &str) -> Result<(), String> {
     if text.len() > MAX_CONTINUE_TEXT_BYTES {
@@ -281,7 +342,11 @@ fn apply_continue_text(state: &Arc<SharedState>, text: &str) -> Result<(), Strin
 }
 
 /// `/sleep max <n>`：单次人工 turn 的续跑上限。
-async fn set_max(state: &Arc<SharedState>, ctx: &WorkerCommandContext, value: &str) -> HandlerResult {
+async fn set_max(
+    state: &Arc<SharedState>,
+    ctx: &WorkerCommandContext,
+    value: &str,
+) -> HandlerResult {
     let Some(max) = parse_positive(value) else {
         return display(
             &format!("{PREFIX}`max` 只接受正整数。用法：`/sleep max 200`。"),
@@ -383,20 +448,20 @@ async fn edit_tools(
                 return display(&format!("{PREFIX}`{tool}` 已经在名单里。"), false);
             }
             tools.push(tool.clone());
-        },
+        }
         "remove" => {
             let before = tools.len();
             tools.retain(|name| name != &tool);
             if tools.len() == before {
                 return display(&format!("{PREFIX}`{tool}` 不在名单里。"), false);
             }
-        },
+        }
         other => {
             return display(
                 &format!("{PREFIX}未知操作 `{other}`。用法：`/sleep tools add|remove <tool>`。"),
                 true,
             );
-        },
+        }
     }
 
     let list = render_tools(&config.answer.tools);
@@ -437,7 +502,24 @@ async fn status(state: &Arc<SharedState>, ctx: &WorkerCommandContext) -> Handler
         format!("{PREFIX}本会话开关 {}", switch.label()),
         effective(state, ctx).await,
         format!("  预算：{}/{}", progress.continuations, config.max),
-        format!("  空转链：{}（阈值 {}）", progress.idle_streak, render_idle(config.idle_stop)),
+        format!(
+            "  空转链：{}（阈值 {}）",
+            progress.idle_streak,
+            render_threshold(config.idle_stop)
+        ),
+        format!(
+            "  复读链：{}（阈值 {}）",
+            progress.no_progress_streak,
+            render_threshold(config.no_progress_stop)
+        ),
+        format!(
+            "  失败重试：{}/{}，最近一次失败：{}",
+            progress.retries,
+            render_threshold(config.retry_max),
+            state
+                .last_failure(ctx.session_id())
+                .unwrap_or_else(|| "无".to_owned())
+        ),
         format!(
             "  最近停止原因：{}",
             progress
@@ -451,9 +533,14 @@ async fn status(state: &Arc<SharedState>, ctx: &WorkerCommandContext) -> Handler
             render_tools(&config.answer.tools)
         ),
         format!("  续跑文本：「{}」", config.continue_text),
+        format!("  纠正提示：「{}」", config.nudge_text),
         format!(
-            "  运行期统计：续跑 {} 次，自动应答 {} 次，空转熔断 {} 次",
-            stats.continuations, stats.answers, stats.idle_stops
+            "  运行期统计：续跑 {} 次，自动应答 {} 次，空转熔断 {} 次，复读熔断 {} 次，失败重试 {} 次",
+            stats.continuations,
+            stats.answers,
+            stats.idle_stops,
+            stats.no_progress_stops,
+            stats.retries
         ),
         format!("  配置文件：{}", state.store_path().display()),
     ];
@@ -475,9 +562,7 @@ async fn effective(state: &Arc<SharedState>, ctx: &WorkerCommandContext) -> Stri
             config.continue_text, config.max
         ),
         SessionSwitch::Off => "本会话已显式关闭（`/sleep on` 可重新开启）：不会续跑。".to_owned(),
-        SessionSwitch::Unset => {
-            "本会话未开启过（`/sleep on` 开启）：不会续跑。".to_owned()
-        },
+        SessionSwitch::Unset => "本会话未开启过（`/sleep on` 开启）：不会续跑。".to_owned(),
     }
 }
 
@@ -501,11 +586,12 @@ fn render_tools(tools: &[String]) -> String {
     }
 }
 
-fn render_idle(idle_stop: u32) -> String {
-    if idle_stop == 0 {
+/// 熔断阈值的显示：0 表示关闭。
+fn render_threshold(value: u32) -> String {
+    if value == 0 {
         "关闭".to_owned()
     } else {
-        idle_stop.to_string()
+        value.to_string()
     }
 }
 
@@ -522,7 +608,11 @@ fn parse_on_off(value: &str) -> Option<bool> {
 }
 
 fn parse_positive(value: &str) -> Option<u32> {
-    value.trim().parse::<u32>().ok().filter(|number| *number > 0)
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|number| *number > 0)
 }
 
 fn parse_non_negative(value: &str) -> Option<u32> {
@@ -541,8 +631,14 @@ fn render_help() -> String {
     );
     lines.push(format!(
         "到达上限只停止续跑、开关保持开启——再次输入任意消息即重置预算。\
-         连续多次续跑都没有工具调用时会触发空转熔断，最近原因见 `/sleep status`。{MOON}"
+         连续多次续跑都没有工具调用时会触发空转熔断，回复与上一次重复或为空时会触发复读熔断，\
+         两者都会改用纠正提示而不是裸的「继续」；最近原因见 `/sleep status`。{MOON}"
     ));
+    lines.push(
+        "turn 因传输中断、限流等原因失败时会自动重试（有界退避，次数上限见配置 retryMax）；\
+         模型不存在、鉴权失败这类重试也没用的错误会直接停下，原因见 `/sleep status`。"
+            .to_owned(),
+    );
     lines.join("\n")
 }
 
@@ -707,8 +803,8 @@ mod tests {
     fn rendering_empty_lists_and_a_disabled_breaker_reads_clearly() {
         assert_eq!(render_tools(&[]), "（无）");
         assert_eq!(render_tools(&["askUser".to_owned()]), "askUser");
-        assert_eq!(render_idle(0), "关闭");
-        assert_eq!(render_idle(3), "3");
+        assert_eq!(render_threshold(0), "关闭");
+        assert_eq!(render_threshold(3), "3");
     }
 
     #[test]
