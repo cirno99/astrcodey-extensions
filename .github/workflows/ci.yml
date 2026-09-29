@@ -11,20 +11,20 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      # 工作区的宿主依赖走本地路径 `../astrcodey/crates/...`，因此宿主仓库必须检出成
-      # 同级目录。`astrcodey` 若是私有仓库，需要配一个 `ASTRCODEY_TOKEN` secret
+      # 工作区的宿主依赖走本地路径 `../astrcodez/crates/...`，因此宿主仓库必须检出成
+      # 同级目录。`astrcodez` 若是私有仓库，需要配一个 `ASTRCODEZ_TOKEN` secret
       # （fine-grained PAT，只读 contents）；公开仓库则自动回落到默认 token。
       - name: Checkout astrcodey-extensions
         uses: actions/checkout@v4
         with:
           path: astrcodey-extensions
 
-      - name: Checkout astrcodey as a sibling
+      - name: Checkout astrcodez as a sibling
         uses: actions/checkout@v4
         with:
-          repository: whatevertogo/astrcodey
-          path: astrcodey
-          token: ${{ secrets.ASTRCODEY_TOKEN || github.token }}
+          repository: cirno99/astrcodez
+          path: astrcodez
+          token: ${{ secrets.ASTRCODEZ_TOKEN || github.token }}
 
       - name: Show toolchain
         working-directory: astrcodey-extensions

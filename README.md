@@ -18,10 +18,10 @@ crates/
 scripts/install.sh              构建并安装到 ~/.astrcode/extensions/
 ```
 
-宿主依赖走本地路径（`astrcodey` 未发布到 crates.io）：
+宿主依赖走本地路径（`astrcodez` 未发布到 crates.io）：
 
 ```toml
-astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-worker" }
+astrcode-extension-worker = { path = "../astrcodez/crates/astrcode-extension-worker" }
 ```
 
 换成远程依赖只需改工作区根 `Cargo.toml` 的 `[workspace.dependencies]` 一处。
@@ -56,7 +56,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/install.sh                                    # 装到 ~/.astrcode/extensions/
 
 # 线缆一致性验收：证明二进制是合法的 S5R 3.0 worker
-cd ../astrcodey && cargo run -p astrcode-s5r-runtime --features conformance --bin s5r-conformance -- \
+cd ../astrcodez && cargo run -p astrcode-s5r-runtime --features conformance --bin s5r-conformance -- \
   --extension-id astrcode-cache-usage -- \
   ../astrcodey-extensions/target/release/astrcode-ext-cache-usage
 ```
@@ -846,5 +846,5 @@ hashline-edit 编辑热路径的实测数字见上方「性能」与 `hashline/h
 5. 用 `s5r-conformance` 跑一遍线缆验收。
 6. 在 `scripts/install.sh` 之外自备安装目标，或把新扩展加进脚本。
 
-参考实现：`astrcodey/crates/astrcode-extensions/tests/s5r-guest/`。
-协议细节：`astrcodey/docs/s5r-protocol.md`、`astrcodey/docs/extension-author-guide.md`。
+参考实现：`astrcodez/crates/astrcode-extensions/tests/s5r-guest/`。
+协议细节：`astrcodez/docs/s5r-protocol.md`、`astrcodez/docs/extension-author-guide.md`。

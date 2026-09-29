@@ -18,11 +18,11 @@ rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
-# 宿主 SDK：磁盘 s5r 扩展的作者面。astrcodey 未发布到 crates.io，因此走本地路径。
+# 宿主 SDK：磁盘 s5r 扩展的作者面。astrcodez 未发布到 crates.io，因此走本地路径。
 # 若改为远程依赖，只需改这一处：
-#   astrcode-extension-worker = { git = "https://github.com/whatevertogo/astrcodey", branch = "main" }
-astrcode-extension-sdk = { path = "../astrcodey/crates/astrcode-extension-sdk" }
-astrcode-extension-worker = { path = "../astrcodey/crates/astrcode-extension-worker" }
+#   astrcode-extension-worker = { git = "https://github.com/cirno99/astrcodez", branch = "main" }
+astrcode-extension-sdk = { path = "../astrcodez/crates/astrcode-extension-sdk" }
+astrcode-extension-worker = { path = "../astrcodez/crates/astrcode-extension-worker" }
 
 astrcode-ext-common = { path = "crates/astrcode-ext-common" }
 
