@@ -34,6 +34,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs2",
+ "rustc-hash",
  "serde",
  "serde_json",
  "thiserror",
@@ -52,17 +53,6 @@ dependencies = [
  "astrcode-extension-worker",
  "async-trait",
  "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "astrcode-ext-cache-usage"
-version = "0.1.0"
-dependencies = [
- "astrcode-ext-common",
- "astrcode-extension-worker",
- "async-trait",
  "serde_json",
  "tokio",
 ]
@@ -154,6 +144,7 @@ dependencies = [
  "async-trait",
  "base64",
  "futures-util",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -171,6 +162,7 @@ dependencies = [
  "astrcode-s5r-runtime",
  "async-trait",
  "futures-util",
+ "rustc-hash",
  "serde",
  "serde_json",
  "tokio",
@@ -191,6 +183,7 @@ dependencies = [
  "astrcode-extension-sdk",
  "async-trait",
  "futures-util",
+ "rustc-hash",
  "serde_json",
  "thiserror",
  "tokio",

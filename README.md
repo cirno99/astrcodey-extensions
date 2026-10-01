@@ -8,7 +8,6 @@ AstrCode 的**磁盘 s5r 扩展**工作区。用 Rust 写原生扩展进程（�
 ```
 crates/
   astrcode-ext-common/          扩展共用工具（不依赖宿主 SDK，可完整单元测试）
-  astrcode-ext-cache-usage/     /usage —— 查看会话的 prompt 缓存命中率
   astrcode-ext-cache-doctor/    before_provider_request —— 观测 prompt 前缀，定位缓存断点
   astrcode-ext-context-offload/ post_tool_use —— 把过大的工具输出换成可检索的占位符
   astrcode-ext-hashline-edit/   hashline_read/replace/undo —— 哈希锚点编辑（每行一个地址）
@@ -57,70 +56,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # 线缆一致性验收：证明二进制是合法的 S5R 3.0 worker
 cd ../astrcodez && cargo run -p astrcode-s5r-runtime --features conformance --bin s5r-conformance -- \
-  --extension-id astrcode-cache-usage -- \
-  ../astrcodey-extensions/target/release/astrcode-ext-cache-usage
+  --extension-id astrcode-cache-doctor -- \
+  ../astrcodey-extensions/target/release/astrcode-ext-cache-doctor
 ```
 
 ---
 
-## `astrcode-cache-usage`
-
-### 用法
-
-```
-/usage
-```
-
-扫描当前会话的 durable 事件流，汇总每个模型请求的 `TokenUsageRecorded` 载荷，输出：
-
-```
-缓存命中 87.3% · 输入 1.20M（命中 1.05M / 未命中 150.0K） · 输出 45.6K · 128 次请求
-明细：缓存写入 12.0K · 推理 8.0K · 上下文窗口 1.00M · 状态栏已更新为 cache 87.3%
-```
-
-同时把状态栏那一格更新成 `cache 87.3%`（命令行版页脚、网页版输入栏底部）。
-
-### 为什么必须读原始事件
-
-宿主的省事接口 `astrcode.session.history.token_usage` 只返回
-`non-cached input + output` 与上下文窗口（见 `host_router/session.rs` 的
-`history_token_usage`，它累加的是 `LlmTokenUsage::non_cached_tokens()`），**不含缓存字段**，
-反推不出命中率。完整的 `LlmTokenUsage`（`cached_input_tokens`、
-`cache_creation_input_tokens`、`input_accounting`）只出现在 durable 事件
-`TokenUsageRecorded` 的载荷里，所以走 `astrcode.session.read_events` 分页读取。
-
-### 命中率口径
-
-provider 的 input 计数语义不同，直接相加会算错分母，因此按样本归一化后再累加：
-
-| `input_accounting` | 完整 prompt | 命中 |
-|---|---|---|
-| `inclusive`（OpenAI 风格，`input_tokens` 已含缓存读取） | `input_tokens` | `cached_input_tokens` |
-| `components`（Anthropic 风格，三段独立） | `input + cache_creation + cached` | `cached_input_tokens` |
-
-未声明语义但出现 `cache_creation_input_tokens` 时按 `components` 处理。
-这套判定与宿主 `LlmTokenUsage::non_cached_tokens` 的兜底路径逐位一致，
-因此插件的「未命中」与宿主自身的 token 预算统计口径相同。
-
-### 平台硬限制
-
-这两条是 S5R 协议的边界，不是实现取舍：
-
-1. **无法注册状态栏条目。** S5R 的 `InitializeManifest` 没有 `status_items` 字段且
-   `deny_unknown_fields`，宿主 `S5rExtension::register()` 也不注册任何状态栏项
-   （对比进程内 bundled 的 `mode` 扩展，它走 `Registrar::status_item` 所以能常驻）。
-   因此那一格**只在第一次执行 `/usage` 之后**才出现。宿主不要求该 id 预先注册：
-   前端 `applyDelta` 与 CLI `handle_event` 都直接按 id 写入渲染表。
-2. **无法每轮自动刷新。** 向外推送状态更新的入口只有「命令结果携带 `status_update`」
-   （`ExtensionCommandResult::Display`）这一条；钩子返回值没有对应字段。
-   做不到 Claude Code 那种每轮自动刷新的用量条——那需要改宿主。
-
-### 输出能力
-
-插件只能输出纯文本：命令结果是 `Display { content }`，状态栏是一格 `text`。
-没有表格、进度条、配色或图表，只能靠文字排版。
-
----
 
 ## `astrcode-context-offload`
 
@@ -162,7 +103,7 @@ ref。
 
 1. **无法撤销替换。** 见上：durable 记录里留下的是占位符，原文只在插件数据目录。
 2. **`retrieve` 自身的结果不换出。** 否则模型会陷入「retrieve → 又得到占位符」的死循环。
-3. **无法注册状态栏条目。** 与 cache-usage 相同：S5R 的 `InitializeManifest` 没有
+3. **无法注册状态栏条目。** 与 cache-doctor 相同：S5R 的 `InitializeManifest` 没有
    `status_items` 字段，那一格只在第一次执行 `/offload` 之后出现。
 4. **阈值按字符数而非 token 数。** 工具热路径上不该为了精确阈值再走一次宿主 IPC；
    8000 字符对中文与代码都已经明显值得换出。
@@ -358,7 +299,7 @@ provider 的 prompt 缓存是**前缀缓存**：只有从第一条消息开始�
 | 长缓存保留 | 宿主已内建：`prompt_cache_retention` profile 能力（`astrcode-core/src/config/raw.rs:162`） |
 | Anthropic TTL 顺序修正 | 宿主已内建：`astrcode-ai/src/wire/anthropic/body.rs:344` 的 `cache_control: ephemeral` |
 | `<session-overview>` 去抖 | trellis 特有块，AstrCode 不存在 → 不适用 |
-| 缓存命中率统计 | 已由 `astrcode-cache-usage` 的 `/usage` 覆盖；本插件的 `doctor` / `stats` 复用同一口径 |
+| 缓存命中率统计 | 宿主已内建：会话指标行（输入栏底部）显示累计输入/输出与缓存命中率 |
 | 工具重排（`normalizeToolsInPayload`） | `ProviderHookInput`（`astrcode-extension-sdk/src/s5r/hooks.rs:57`）没有 tools → **不可达** |
 | 请求体参数（cache key / retention / temperature） | 无请求体钩子，`ProviderResult` 只有 4 个变体（`extension/hooks/results.rs:102`）→ **不可达** |
 | proxy affinity / adaptive-thinking 兼容诊断 | 钩子上下文里 `ModelSelection.provider_kind` 恒为空串（`turn_context.rs:128`）→ **不可达** |
@@ -805,7 +746,7 @@ cargo test -p astrcode-ext-hashline-edit --release --test hasher_comparison -- -
 两个 crate 都在 `astrcode-ext-common` 里封装成可复用模块（`arena`、`json`），带单元测试，
 各扩展按需取用。**先说清楚哪条路径用不上**：宿主经 S5R 交给插件的事件是**已经解析好的**
 `serde_json::Value`（`HostSessionEvent::payload`），线缆上没有任何原始字节暴露给插件。
-只从 DOM 里取几个 `u64` 的汇总（`cache-usage` / `cache-doctor` 的用量统计）因此既不需要
+只从 DOM 里取几个 `u64` 的汇总（`cache-doctor` 的用量统计）因此既不需要
 竞技场也不需要 simd-json——把 `Value` 再序列化成字节交给 simd-json 重解析是负优化。
 
 用得上的是**插件自己拥有的字节缓冲**。当前接入点：

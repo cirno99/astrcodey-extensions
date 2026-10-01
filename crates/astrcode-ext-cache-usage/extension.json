@@ -1,5 +1,0 @@
-{
-  "extension_id": "astrcode-cache-usage",
-  "protocol": { "s5r": "3.0" },
-  "command": ["./astrcode-ext-cache-usage"]
-}

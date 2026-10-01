@@ -10,7 +10,6 @@
 //!
 //! 指纹是消息序列化字节的 FNV-1a 哈希；摘要只记录结构标签与字节数。插件在内存里
 //! 留下的是「第 7 条 tool 消息，8.2K 字符」这样的结构性事实，而不是 prompt 内容。
-//! 这一点与 `astrcode-ext-cache-usage` 的「不落盘 prompt 数据」约定一致。
 
 use astrcode_extension_sdk::llm::{LlmContent, LlmMessage};
 use astrcode_ext_common::paths::fnv1a_bytes;

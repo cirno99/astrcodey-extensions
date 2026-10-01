@@ -19,7 +19,6 @@ use crate::{
 /// 磁盘 s5r 插件**无法注册**状态栏条目（S5R 的 `InitializeManifest` 没有
 /// `status_items` 字段），只能在命令结果里携带 `status_update`。宿主不要求该 id
 /// 预先注册：前端 `applyDelta` 与 CLI `handle_event` 都会直接按 id 写入渲染表。
-/// 刻意与 `astrcode-cache-usage` 的 `cache-hit` 区分开，两格各显示各的。
 pub const STATUS_ITEM_ID: &str = "cache-prefix";
 
 /// 命令输出的统一前缀。

@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/astrcode-ext-common",
     "crates/astrcode-ext-cache-doctor",
-    "crates/astrcode-ext-cache-usage",
     "crates/astrcode-ext-context-offload",
     "crates/astrcode-ext-hashline-edit",
     "crates/astrcode-ext-rtk-optimizer",

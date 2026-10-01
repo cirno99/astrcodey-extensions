@@ -7,11 +7,11 @@
 //! 完整的 `LlmTokenUsage`（含 `cached_input_tokens` / `cache_creation_input_tokens`
 //! / `input_accounting`）只出现在 durable 事件 `TokenUsageRecorded` 的载荷里。
 //!
-//! # 与 `astrcode-ext-cache-usage` 的关系
+//! # 归一化口径
 //!
-//! 本模块的事件形状解析与该插件同源。真正会随 provider 语义漂移的部分——命中率的
-//! 归一化口径——已经在 `astrcode-ext-common::stats` 里共享；这里重复的只是「事件
-//! 载荷 → `UsageSample`」这一层薄映射，目的是让每个扩展都能独立安装、独立演进。
+//! 真正会随 provider 语义漂移的部分——命中率的归一化口径——已经在
+//! `astrcode-ext-common::stats` 里共享；这里重复的只是「事件载荷 → `UsageSample`」
+//! 这一层薄映射，目的是让每个扩展都能独立安装、独立演进。
 
 use astrcode_ext_common::stats::{InputAccounting, UsageSample, UsageTotals};
 use astrcode_extension_worker::worker_prelude::*;
