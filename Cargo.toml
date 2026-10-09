@@ -5,9 +5,11 @@ members = [
     "crates/astrcode-ext-cache-doctor",
     "crates/astrcode-ext-context-offload",
     "crates/astrcode-ext-hashline-edit",
+    "crates/astrcode-ext-anki-deck",
     "crates/astrcode-ext-rtk-optimizer",
     "crates/astrcode-ext-weneed",
     "crates/astrcode-ext-sleep-continue",
+    "crates/astrcode-ext-promptsmith",
 ]
 
 [workspace.package]
@@ -42,6 +44,9 @@ rustc-hash = "2"
 # 正则：rtk-optimizer 的构建/测试/linter/源码过滤识别规则直接来自上游 TS 实现，
 # 逐条改写成正则字面量才能逐条对照验收；手写扫描器会在十几处引入静默分歧。
 regex = "1"
+
+# GUID 派生（anki-deck）：SHA-256 前 8 字节 → Anki base91，对齐 genanki 的 guid_for。
+sha2 = "0.10"
 
 # 竞技场分配器：单次调用内的临时分配，调用结束整体复位，不逐块归还全局分配器。
 bumpalo = { version = "3", features = ["collections"] }

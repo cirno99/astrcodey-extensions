@@ -26,6 +26,25 @@ Hash-anchored editing is available: use hashline_read to read a file as HASH│c
 
 ---
 
+## Anki 牌组生成（`astrcode-ext-anki-deck`）
+
+- **源码位置**：`crates/astrcode-ext-anki-deck/src/prompt.rs` 的 `GUIDANCE`
+- **注入时机**：`prompt_build` 钩子常驻，宿主映射为 `ExtensionSection::PlatformInstructions`，
+  落在 system prompt 的静态前缀区，只在贡献变化时让 provider 前缀缓存失效
+- **注入内容**：
+
+```
+Anki deck packaging is available: anki_write_apkg turns a JSON deck spec into a ready-to-import .apkg file. Gather flashcards from the markdown notes yourself (read the vault with your file tools), then call the tool once per top-level deck. Spec: output is the target .apkg path; deck.name uses :: for subdecks (e.g. "Rust::Ownership"); deck.cards carry front/back (HTML allowed), cloze:true plus {{c1::...}} markers in the front for cloze cards, whitespace-free tags, and id — a stable identity like "vault:notes/rust.md#ownership" derived from the source path and heading, which fixes the note GUID so regenerating a vault and re-importing updates cards instead of duplicating them; deck.media lists referenced image/audio paths, referenced in card HTML by bare file name. The tool validates the spec and returns [E_*] errors with corrective hints; report the output path and card count when done.
+```
+
+**在本仓库工作的含义**：职责切分是「语义活归 agent，确定性活归工具」——哪些内容值得做成
+卡、卡面怎么组织由模型决定；打包由 `anki_write_apkg` 完成，模型不手搓产物。卡片必须带
+`id`（vault 相对路径 # 标题这类稳定身份），它和牌组名一起派生 GUID，重复生成再导入 Anki
+是**更新**而不是重复卡。挖空卡 front 里写 `{{cN::…}}`；媒体按裸文件名在 HTML 里引用，
+路径传进 `deck.media`。工具报 `[E_*]` 时按提示修正入参重试，不要换路子绕过校验。
+
+---
+
 ## we need 规范（`astrcode-ext-weneed`）
 
 这个扩展有**两段**模型可见的英文工件：常驻的完整规范，以及条件追加的贴尾提醒。

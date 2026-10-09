@@ -1,0 +1,22 @@
+[package]
+name = "astrcode-ext-promptsmith"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：把草稿改写成更强的提示词，默认只预览，由用户决定何时发送"
+
+[[bin]]
+name = "astrcode-ext-promptsmith"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+# 插件数据目录布局与配置文件的读写生命周期。
+astrcode-ext-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# 意图分类的规则来自上游 TS 的正则字面量，逐条对照移植，不做手写扫描的近似。
+regex.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

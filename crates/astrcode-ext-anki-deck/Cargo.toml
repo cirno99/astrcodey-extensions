@@ -1,0 +1,30 @@
+[package]
+name = "astrcode-ext-anki-deck"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AstrCode 插件：Anki 牌组生成（anki_write_apkg，把 JSON 牌组规范打成 .apkg）"
+
+[[bin]]
+name = "astrcode-ext-anki-deck"
+path = "src/main.rs"
+
+[dependencies]
+astrcode-extension-worker.workspace = true
+astrcode-extension-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+# apkg 里的 collection.anki2 是货真价实的 SQLite 文件，Anki 导入时按 SQLite 打开读表，
+# 没有替代格式；`bundled` 从源码编译 SQLite，保证独立二进制零系统依赖。
+rusqlite = { version = "0.40", features = ["bundled"] }
+# apkg 外壳是 zip（collection + media manifest + 媒体文件）。
+zip = "8"
+# GUID 用 SHA-256 前 8 字节派生（对齐 genanki 的 guid_for 思路）；csum 按 genanki 恒写 0，
+# 导入方会重建，不需要额外哈希。
+sha2.workspace = true
+[dev-dependencies]
+# `testing` feature 只用于测试，不进入生产依赖：它暴露 HostApi 注入缝隙。
+astrcode-extension-worker = { workspace = true, features = ["testing"] }

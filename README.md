@@ -11,6 +11,7 @@ crates/
   astrcode-ext-cache-doctor/    before_provider_request —— 观测 prompt 前缀，定位缓存断点
   astrcode-ext-context-offload/ post_tool_use —— 把过大的工具输出换成可检索的占位符
   astrcode-ext-hashline-edit/   hashline_read/replace/undo —— 哈希锚点编辑（每行一个地址）
+  astrcode-ext-anki-deck/       anki_write_apkg —— 把 JSON 牌组规范打成 .apkg（agent 挑卡，工具打包）
   astrcode-ext-rtk-optimizer/   tool_input_transform + post_tool_use —— 命令改写与输出压缩
   astrcode-ext-weneed/          prompt_build + provider_contribution + pre_tool_use —— DeepSeek 的 we need 规范
   astrcode-ext-sleep-continue/  continue_after_stop + pre_tool_use + post_tool_use + turn_end —— 无人值守续跑与失败重试
